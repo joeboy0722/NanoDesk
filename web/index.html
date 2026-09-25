@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>NanoDesk - 輕量極速 Web 遠端桌面</title>
+    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- 頂部控制列 -->
+    <header id="topBar">
+        <div class="left-group">
+            <span class="logo">
+                <img src="logo.png" class="logo-img" alt="NanoDesk">
+                <span>NanoDesk</span>
+            </span>
+            <div class="status-indicator">
+                <span id="statusDot" class="dot disconnected"></span>
+                <span id="statusText">正在連線...</span>
+            </div>
+            <!-- 多螢幕切換選單 -->
+            <label for="monitorSelect" class="label">螢幕：</label>
+            <select id="monitorSelect">
+                <option value="0">載入中...</option>
+            </select>
+        </div>
+
+        <div class="center-group">
+            <!-- 當前授權身分角色徽章 -->
+            <span id="roleBadge" class="role-badge">🔒 驗證中</span>
+            <span class="divider"></span>
+            <!-- KVM 專屬系統組合鍵 -->
+            <div id="shortcutGroup" class="shortcut-group">
+                <button class="btn btn-shortcut" data-key="win" title="打開 Windows 開始功能表">⊞ Win</button>
+                <button class="btn btn-shortcut" data-key="alt_tab" title="切換遠端視窗">Alt+Tab</button>
+                <button class="btn btn-shortcut" data-key="win_d" title="顯示或隱藏桌面">Win+D</button>
+                <!-- 特權管理員組合鍵 (僅限完全控制角色) -->
+                <button class="btn btn-shortcut btn-admin" data-key="ctrl_shift_esc" title="開啟工作管理員">工作管理員</button>
+                <button class="btn btn-shortcut btn-danger btn-admin" data-key="ctrl_alt_del" title="發送安全組合鍵">Ctrl+Alt+Del</button>
+            </div>
+        </div>
+
+        <div class="right-group">
+            <!-- 即時性能統計資訊 -->
+            <span id="statsFps" class="stat-badge">0 FPS</span>
+            <span id="statsBitrate" class="stat-badge">0 Kbps</span>
+            <button id="fullscreenBtn" class="btn" title="切換全螢幕">⛶ 全螢幕</button>
+        </div>
+    </header>
+
+    <!-- 畫面容器 -->
+    <main id="viewport">
+        <!-- 原生 Canvas 渲染畫布 (支援鍵盤焦點) -->
+        <canvas id="screenCanvas" tabindex="0"></canvas>
+
+        <!-- 檔案拖曳懸浮遮罩 -->
+        <div id="dropOverlay" class="drop-overlay hidden">
+            <div class="drop-box">
+                <div class="drop-icon">📂</div>
+                <h2>放開以傳送檔案至遠端桌面</h2>
+                <p>支援任意檔案格式，自動存放至遠端電腦 Desktop</p>
+            </div>
+        </div>
+
+        <!-- 浮動通知提示 (Toast) -->
+        <div id="toast" class="toast hidden"></div>
+
+        <!-- 檔案上傳進度懸浮彈窗 -->
+        <div id="uploadProgressModal" class="upload-modal hidden">
+            <div class="upload-card">
+                <div class="upload-header">
+                    <span class="upload-icon">📤</span>
+                    <span id="uploadFileName" class="upload-filename">正在傳送檔案...</span>
+                </div>
+                <div class="progress-bar-bg">
+                    <div id="uploadProgressBar" class="progress-bar-fill" style="width: 0%;"></div>
+                </div>
+                <div class="upload-info">
+                    <span id="uploadProgressPercent">0%</span>
+                    <span id="uploadProgressDetail">0 MB / 0 MB (0 MB/s)</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- 存取認證與審核對話框 (未授權時覆蓋畫面，保護被控端隱私) -->
+        <div id="authOverlay" class="auth-overlay">
+            <div class="auth-card">
+                <div class="auth-logo">
+                    <img src="logo.png" class="auth-logo-img" alt="NanoDesk">
+                </div>
+                <h2>NanoDesk 遠端連線授權</h2>
+                <p class="auth-desc">請輸入 6 位數存取密碼，或向被控端主人發送審核請求。</p>
+
+                <!-- 方式一：密碼直接登入 -->
+                <div id="authPwdSection" class="auth-section">
+                    <div class="input-row">
+                        <input type="password" id="authPasswordInput" placeholder="請輸入存取密碼" maxlength="20" autofocus>
+                        <button id="authLoginBtn" class="btn btn-primary">連線</button>
+                    </div>
+                    <div id="authErrorMsg" class="auth-error hidden"></div>
+                </div>
+
+                <div class="auth-divider">
+                    <span>或</span>
+                </div>
+
+                <!-- 方式二：發起審核請求 -->
+                <div id="authRequestSection" class="auth-section">
+                    <button id="authRequestBtn" class="btn btn-secondary">📩 向被控端發送連線請求</button>
+                    <div id="authPendingStatus" class="auth-pending hidden">
+                        <div class="spinner"></div>
+                        <p id="authPendingText">已發送審核請求，等待被控端主人核准中...</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- WebCodecs 不支援提示遮罩 (若有) -->
+        <div id="unsupportedOverlay" class="overlay hidden">
+            <div class="overlay-box">
+                <h2>⚠️ 瀏覽器不支援 WebCodecs</h2>
+                <p>請使用最新版本的 Chrome、Edge 或 Safari 瀏覽器以獲得極速 H.264 硬體解碼體驗。</p>
+            </div>
+        </div>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>

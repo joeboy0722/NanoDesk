@@ -1,0 +1,21 @@
+# 二進位執行檔與暫存庫
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+*.a
+
+# 測試輸出與暫存畫面
+*.bmp
+*.png
+!web/logo.png
+*.jpg
+*.h264
+
+# 系統與編輯器快取
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
