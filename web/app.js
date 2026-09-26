@@ -44,16 +44,42 @@
     const saveNicknameBtn = document.getElementById('saveNicknameBtn');
     const membersList = document.getElementById('membersList');
     const membersModalCount = document.getElementById('membersModalCount');
+    const video = document.getElementById('screenVideo');
+    const engineBadge = document.getElementById('engineBadge');
 
-    // 檢查瀏覽器是否支援 WebCodecs API
-    if (!('VideoDecoder' in window)) {
+    // 檢查瀏覽器解碼能力：優先採用 WebCodecs 硬解；非安全環境 (純 HTTP) 則切換至 MSE (jmuxer)
+    const isWebCodecsSupported = ('VideoDecoder' in window);
+    const isMseSupported = ('MediaSource' in window) && (typeof JMuxer !== 'undefined');
+
+    if (!isWebCodecsSupported && !isMseSupported) {
         unsupportedOverlay.classList.remove('hidden');
-        statusText.textContent = '不支援 WebCodecs';
+        statusText.textContent = '瀏覽器不支援視訊解碼';
         return;
+    }
+
+    // 當前畫面渲染作用元素 (Canvas 或 Video)
+    let activeDisplayElement = canvas;
+    if (isWebCodecsSupported) {
+        canvas.style.display = 'block';
+        if (video) video.style.display = 'none';
+        activeDisplayElement = canvas;
+        if (engineBadge) {
+            engineBadge.textContent = '⚡ 硬解 (WebCodecs)';
+            engineBadge.style.color = '#58a6ff';
+        }
+    } else {
+        canvas.style.display = 'none';
+        if (video) video.style.display = 'block';
+        activeDisplayElement = video;
+        if (engineBadge) {
+            engineBadge.textContent = '🌐 相容 (MSE)';
+            engineBadge.style.color = '#3fb950';
+        }
     }
 
     let ws = null;
     let decoder = null;
+    let jmuxer = null;
     let frameCounter = 0;
     let byteCounter = 0;
     let lastStatsTime = performance.now();
@@ -218,26 +244,43 @@
         });
     });
 
-    // 1. 初始化 WebCodecs 硬體解碼器
+    // 1. 初始化視訊解碼器 (自適應 WebCodecs 硬解 / MSE 串流)
     function initDecoder() {
-        if (decoder && decoder.state !== 'closed') {
-            try { decoder.close(); } catch (e) {}
-        }
         hasReceivedKeyframe = false;
 
-        decoder = new VideoDecoder({
-            output: handleDecodedFrame,
-            error: (err) => {
-                console.error('[WebCodecs 解碼錯誤]', err);
-                requestKeyframe();
+        if (isWebCodecsSupported) {
+            if (decoder && decoder.state !== 'closed') {
+                try { decoder.close(); } catch (e) {}
             }
-        });
 
-        decoder.configure({
-            codec: 'avc1.42E01F',
-            optimizeForLatency: true
-        });
-        console.log('[WebCodecs] 原生 H.264 解碼器已就緒');
+            decoder = new VideoDecoder({
+                output: handleDecodedFrame,
+                error: (err) => {
+                    console.error('[WebCodecs 解碼錯誤]', err);
+                    requestKeyframe();
+                }
+            });
+
+            decoder.configure({
+                codec: 'avc1.42E01F',
+                optimizeForLatency: true
+            });
+            console.log('[WebCodecs] 原生 H.264 解碼器已就緒');
+        } else if (isMseSupported) {
+            if (jmuxer) {
+                try { jmuxer.destroy(); } catch (e) {}
+            }
+
+            jmuxer = new JMuxer({
+                node: 'screenVideo',
+                mode: 'video',
+                flushingTime: 0,
+                clearBuffer: true,
+                fps: 30,
+                debug: false
+            });
+            console.log('[MSE] jMuxer H.264 解碼器已就緒 (相容純 HTTP)');
+        }
     }
 
     // 2. 處理解碼完成的視訊訊框並渲染至 Canvas
@@ -346,18 +389,29 @@
             hasReceivedKeyframe = true;
         }
 
-        try {
-            const chunk = new EncodedVideoChunk({
-                type: isKey ? 'key' : 'delta',
-                timestamp: timestampMs * 1000,
-                data: naluData
-            });
+        if (isWebCodecsSupported) {
+            try {
+                const chunk = new EncodedVideoChunk({
+                    type: isKey ? 'key' : 'delta',
+                    timestamp: timestampMs * 1000,
+                    data: naluData
+                });
 
-            if (decoder && decoder.state === 'configured') {
-                decoder.decode(chunk);
+                if (decoder && decoder.state === 'configured') {
+                    decoder.decode(chunk);
+                }
+            } catch (e) {
+                console.warn('[WebCodecs 訊框解碼略過]', e);
             }
-        } catch (e) {
-            console.warn('[訊框解碼略過]', e);
+        } else if (jmuxer) {
+            try {
+                jmuxer.feed({
+                    video: naluData
+                });
+                frameCounter++;
+            } catch (e) {
+                console.warn('[MSE 訊框解碼略過]', e);
+            }
         }
     }
 
@@ -386,8 +440,20 @@
             monitorSelect.value = msg.current;
         } else if (msg.type === 'clipboard_sync' || msg.type === 'clipboard_data') {
             lastSyncedText = msg.text || '';
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(lastSyncedText).catch(() => {});
+            if (lastSyncedText) {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(lastSyncedText)
+                        .then(() => {
+                            showToast('📋 遠端文字已自動同步至剪貼簿');
+                        })
+                        .catch(() => {
+                            // 非安全環境或瀏覽器阻擋靜默寫入時，彈出帶複製按鈕的互動通知
+                            showClipboardToast(lastSyncedText);
+                        });
+                } else {
+                    // 純 HTTP 環境直接彈出帶複製按鈕的互動通知
+                    showClipboardToast(lastSyncedText);
+                }
             }
         } else if (msg.type === 'clipboard_image_sync') {
             try {
@@ -402,7 +468,11 @@
                 if (navigator.clipboard && navigator.clipboard.write) {
                     navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
                         .then(() => showToast('🖼️ 遠端截圖已自動同步至本機剪貼簿'))
-                        .catch(() => {});
+                        .catch(() => {
+                            showToast('🖼️ 遠端已複製圖片 (HTTP 下請於畫面 Ctrl+V 貼上)');
+                        });
+                } else {
+                    showToast('🖼️ 遠端已複製圖片');
                 }
             } catch (e) {
                 console.error('[圖片剪貼簿解析失敗]', e);
@@ -506,9 +576,10 @@
         }
     }
 
-    // 6. 計算滑鼠在 Canvas 視訊內容中的精確相對歸一化座標 (0.0 ~ 1.0)
+    // 6. 計算滑鼠在視訊渲染元素 (Canvas / Video) 中的精確相對歸一化座標 (0.0 ~ 1.0)
     function getCanvasCoordinates(e) {
-        const rect = canvas.getBoundingClientRect();
+        const displayEl = activeDisplayElement || canvas;
+        const rect = displayEl.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) return null;
 
         const clickX = e.clientX - rect.left;
@@ -532,65 +603,73 @@
         }
     }
 
-    // 7. 滑鼠事件監聽 (僅在角色具備 RoleStandard 以上時允許操作)
+    // 7. 滑鼠事件監聽 (同時相容 Canvas 與 Video 播放元件)
     let moveThrottle = false;
-    canvas.addEventListener('mousemove', (e) => {
-        if (currentRole < 2) return; // 僅觀看模式：禁止滑鼠操作
-        if (moveThrottle) return;
+    const displayElements = [canvas, video].filter(Boolean);
 
-        moveThrottle = true;
-        requestAnimationFrame(() => {
-            moveThrottle = false;
+    displayElements.forEach(el => {
+        el.addEventListener('mousemove', (e) => {
+            if (currentRole < 2) return; // 僅觀看模式：禁止滑鼠操作
+            if (moveThrottle) return;
+
+            moveThrottle = true;
+            requestAnimationFrame(() => {
+                moveThrottle = false;
+                const pos = getCanvasCoordinates(e);
+                if (pos) {
+                    sendControl({
+                        type: 'mouse_move',
+                        x: pos.normX,
+                        y: pos.normY
+                    });
+                }
+            });
+        });
+
+        el.addEventListener('mousedown', (e) => {
+            if (currentRole < 2) return;
+            el.focus();
+
             const pos = getCanvasCoordinates(e);
             if (pos) {
+                sendControl({ type: 'mouse_move', x: pos.normX, y: pos.normY });
                 sendControl({
-                    type: 'mouse_move',
-                    x: pos.normX,
-                    y: pos.normY
+                    type: 'mouse_button',
+                    button: e.button,
+                    isDown: true
                 });
             }
         });
-    });
 
-    canvas.addEventListener('mousedown', (e) => {
-        if (currentRole < 2) return;
-        canvas.focus();
-
-        const pos = getCanvasCoordinates(e);
-        if (pos) {
-            sendControl({ type: 'mouse_move', x: pos.normX, y: pos.normY });
+        el.addEventListener('mouseup', (e) => {
+            if (currentRole < 2) return;
             sendControl({
                 type: 'mouse_button',
                 button: e.button,
-                isDown: true
+                isDown: false
             });
-        }
-    });
-
-    canvas.addEventListener('mouseup', (e) => {
-        if (currentRole < 2) return;
-        sendControl({
-            type: 'mouse_button',
-            button: e.button,
-            isDown: false
         });
-    });
 
-    canvas.addEventListener('contextmenu', (e) => {
-        if (currentRole >= 2) {
+        el.addEventListener('contextmenu', (e) => {
+            if (currentRole >= 2) {
+                e.preventDefault();
+            }
+        });
+
+        el.addEventListener('wheel', (e) => {
+            if (currentRole < 2) return;
             e.preventDefault();
-        }
-    });
+            sendControl({
+                type: 'mouse_wheel',
+                deltaX: Math.round(e.deltaX),
+                deltaY: Math.round(e.deltaY)
+            });
+        }, { passive: false });
 
-    canvas.addEventListener('wheel', (e) => {
-        if (currentRole < 2) return;
-        e.preventDefault();
-        sendControl({
-            type: 'mouse_wheel',
-            deltaX: Math.round(e.deltaX),
-            deltaY: Math.round(e.deltaY)
+        el.addEventListener('mouseenter', () => {
+            checkAndSyncLocalClipboardImage();
         });
-    }, { passive: false });
+    });
 
     // 8. 鍵盤事件監聽 (僅在角色具備 RoleStandard 以上時允許操作)
     window.addEventListener('keydown', (e) => {
@@ -666,10 +745,6 @@
             }).catch(() => {});
         }
     }
-
-    canvas.addEventListener('mouseenter', () => {
-        checkAndSyncLocalClipboardImage();
-    });
 
     window.addEventListener('focus', () => {
         syncClipboardText();
@@ -848,12 +923,68 @@
     let toastTimer = null;
     function showToast(text) {
         if (!toast) return;
+        toast.innerHTML = '';
         toast.textContent = text;
         toast.classList.remove('hidden');
         clearTimeout(toastTimer);
         toastTimer = setTimeout(() => {
             toast.classList.add('hidden');
         }, 3000);
+    }
+
+    // 遠端複製專屬智慧互動通知 (帶點擊複製按鈕，相容純 HTTP / 手勢呼叫)
+    function copyTextFallback(text) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        textarea.style.top = '0';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        try {
+            document.execCommand('copy');
+        } catch (e) {
+            console.warn('[剪貼簿複製失敗]', e);
+        }
+        document.body.removeChild(textarea);
+    }
+
+    function showClipboardToast(text) {
+        if (!toast) return;
+        toast.innerHTML = '';
+
+        const preview = text.length > 20 ? text.substring(0, 20) + '...' : text;
+        const msgSpan = document.createElement('span');
+        msgSpan.textContent = `📋 遠端複製: "${preview}"`;
+
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'toast-btn';
+        copyBtn.textContent = '點擊複製';
+        copyBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(() => copyTextFallback(text));
+            } else {
+                copyTextFallback(text);
+            }
+            copyBtn.textContent = '✔ 已複製';
+            copyBtn.style.backgroundColor = '#2ea043';
+            copyBtn.style.color = '#fff';
+            setTimeout(() => {
+                toast.classList.add('hidden');
+            }, 1200);
+        };
+
+        toast.appendChild(msgSpan);
+        toast.appendChild(copyBtn);
+        toast.classList.remove('hidden');
+
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => {
+            toast.classList.add('hidden');
+        }, 6000); // 留 6 秒供使用者點擊
     }
 
     // 螢幕切換監聽
@@ -866,10 +997,11 @@
         initDecoder();
     });
 
-    // 全螢幕按鈕
+    // 全螢幕按鈕 (將畫面容器整體全螢幕，確保指針與通知均可見)
     fullscreenBtn.addEventListener('click', () => {
         if (!document.fullscreenElement) {
-            canvas.requestFullscreen().catch(err => {
+            const fsTarget = viewport || activeDisplayElement;
+            fsTarget.requestFullscreen().catch(err => {
                 alert(`無法進入全螢幕模式: ${err.message}`);
             });
         } else {

@@ -49,7 +49,8 @@
         </div>
 
         <div class="right-group">
-            <!-- 即時性能統計資訊 -->
+            <!-- 即時性能統計與解碼引擎資訊 -->
+            <span id="engineBadge" class="stat-badge" title="目前視訊解碼引擎">⚡ 硬解</span>
             <span id="statsFps" class="stat-badge">0 FPS</span>
             <span id="statsBitrate" class="stat-badge">0 Kbps</span>
             <button id="fullscreenBtn" class="btn" title="切換全螢幕">⛶ 全螢幕</button>
@@ -58,8 +59,10 @@
 
     <!-- 畫面容器 -->
     <main id="viewport">
-        <!-- 原生 Canvas 渲染畫布 (支援鍵盤焦點) -->
+        <!-- 原生 Canvas 渲染畫布 (支援鍵盤焦點，WebCodecs 模式使用) -->
         <canvas id="screenCanvas" tabindex="0"></canvas>
+        <!-- 原生 Video 渲染播放器 (支援鍵盤焦點，純 HTTP / MSE 相容模式使用) -->
+        <video id="screenVideo" tabindex="0" autoplay muted playsinline style="display: none;"></video>
 
         <!-- 多人協同彩色雷射指示筆圖層 (不干擾操作，直觀指向) -->
         <div id="laserContainer" class="laser-container"></div>
@@ -151,6 +154,7 @@
         </div>
     </main>
 
+    <script src="jmuxer.min.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

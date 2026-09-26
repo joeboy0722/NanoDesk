@@ -199,7 +199,7 @@ select:hover {
     overflow: hidden;
 }
 
-#screenCanvas {
+#screenCanvas, #screenVideo {
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
@@ -209,7 +209,7 @@ select:hover {
     cursor: default;
 }
 
-#screenCanvas:focus {
+#screenCanvas:focus, #screenVideo:focus {
     box-shadow: 0 0 0 1px #58a6ff, 0 0 20px rgba(88, 166, 255, 0.3);
 }
 
@@ -310,12 +310,35 @@ select:hover {
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
     z-index: 100;
     transition: opacity 0.3s, transform 0.3s;
+    display: inline-flex;
+    align-items: center;
+    pointer-events: auto;
 }
 
 .toast.hidden {
     opacity: 0;
     transform: translate(-50%, 10px);
     pointer-events: none;
+}
+
+.toast-btn {
+    margin-left: 12px;
+    background-color: #ffffff;
+    color: #0d1117;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    white-space: nowrap;
+}
+
+.toast-btn:hover {
+    background-color: #f0f6fc;
+    transform: scale(1.04);
 }
 
 /* 檔案上傳進度彈窗樣式 */

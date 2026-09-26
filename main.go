@@ -981,16 +981,13 @@ func main() {
 			gui.ShowFatalError("NanoDesk - HTTPS 服務異常中止", "HTTPS 伺服器監聽發生錯誤：%v", err)
 		}
 	} else {
-		// 預設：純 HTTP 模式 (零憑證問題，連線暢通無阻)
-		fmt.Printf("🌐 已啟動【純 HTTP 模式】(零憑證警告，相容測試環境)\n")
-		fmt.Printf("👉 本機瀏覽器: http://localhost:%d\n", port)
+		// 預設：純 HTTP 模式 (零憑證警告，雙軌解碼自適應)
+		fmt.Printf("🌐 已啟動【純 HTTP 模式】(雙軌解碼：WebCodecs / MSE 自適應)\n")
+		fmt.Printf("👉 本機瀏覽器請開: http://localhost:%d\n", port)
 		for _, ip := range ips {
-			fmt.Printf("👉 測試筆電請開: http://%s:%d\n", ip, port)
+			fmt.Printf("👉 局域網其他電腦/筆電請開: http://%s:%d\n", ip, port)
 		}
-		fmt.Println("\n💡 跨機 WebCodecs 解鎖提示:")
-		fmt.Println("   若筆電瀏覽器顯示「不支援 WebCodecs」，請在【測試筆電】的 Chrome 輸入:")
-		fmt.Println("   chrome://flags/#unsafely-treat-insecure-origin-as-secure")
-		fmt.Printf("   將其設為 Enabled，填入: http://[上述筆電網址]:%d ，重啟瀏覽器即可！\n", port)
+		fmt.Println("✨ 免裝憑證、免開 HTTPS、開箱即用！")
 		fmt.Println("\n按下 Ctrl+C 可停止服務。")
 
 		if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
