@@ -83,12 +83,16 @@
    windres -F pe-x86-64 -i app.rc -o app_windows_amd64.syso
    ```
 
-2. **靜態建置單一執行檔**：
+2. **靜態建置單一純 GUI 執行檔**：
    ```cmd
-   go build -ldflags "-s -w -extldflags '-static'" -o NanoDesk.exe .
+   go build -ldflags "-H windowsgui -s -w -extldflags '-static'" -o NanoDesk.exe .
    ```
 
-產出的 `NanoDesk.exe` 體積小於 **8 MB**，包含所有圖示與前端靜態資源，可直接發布分發。
+產出的 `NanoDesk.exe` 體積小於 **8 MB**，完全為 Windows 原生 GUI 程式（點擊無黑色終端視窗、終端執行亦不影響命令列），包含所有圖示與前端靜態資源，可直接發布分發。
+
+> 💡 **Windows Server 執行注意事項**：
+> Windows Server 預設未啟用「媒體基礎 (Media Foundation)」功能。若在 Windows Server 上運行，請先以管理員身分在 PowerShell 執行：
+> `Install-WindowsFeature Server-Media-Foundation` 後重啟伺服器。若伺服器為無螢幕 (Headless) 狀態，請確保已啟用虛擬顯示驅動或連接螢幕。
 
 ---
 

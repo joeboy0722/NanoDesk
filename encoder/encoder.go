@@ -10,8 +10,22 @@ import "C"
 import (
 	"fmt"
 	"sync"
+	"syscall"
 	"unsafe"
 )
+
+// CheckMediaFoundationAvailable 主動檢查作業系統是否已安裝 Media Foundation 核心元件 (mfplat.dll, mfreadwrite.dll)
+func CheckMediaFoundationAvailable() error {
+	dlls := []string{"mfplat.dll", "mfreadwrite.dll"}
+	for _, dll := range dlls {
+		h, err := syscall.LoadLibrary(dll)
+		if err != nil {
+			return fmt.Errorf("找不到必要的 Windows 媒體核心元件【%s】。\n\n💡 若您使用的是 Windows Server，系統預設未啟用媒體基礎功能。請以系統管理員身分開啟 PowerShell 執行：\n  Install-WindowsFeature Server-Media-Foundation\n\n安裝完成後重啟伺服器即可正常運作。", dll)
+		}
+		syscall.FreeLibrary(h)
+	}
+	return nil
+}
 
 // H264Encoder Windows 原生低延遲 H.264 編碼器封裝
 type H264Encoder struct {
@@ -31,7 +45,7 @@ func NewH264Encoder(width, height, fps, bitrateKbps int) (*H264Encoder, error) {
 		C.int(bitrateKbps),
 	)
 	if ptr == nil {
-		return nil, fmt.Errorf("建立 Windows 原生 H.264 編碼器失敗")
+		return nil, fmt.Errorf("建立 Windows 原生 H.264 編碼器失敗：系統未提供相容之 H.264 MFT 編碼轉換器。請確認 Windows Media Foundation 功能或顯示卡硬體加速運作正常。")
 	}
 
 	maxOut := width * height // 輸出緩衝區上限

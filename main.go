@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -625,8 +626,16 @@ func (h *StreamHub) startStreamingLoop() {
 }
 
 func main() {
-	// 隱藏黑底終端機視窗，達成純 Windows 原生 GUI 現代質感體驗
-	gui.HideConsoleWindow()
+	// 全域未捕捉異常守護 (Panic Recovery)
+	defer func() {
+		if r := recover(); r != nil {
+			stackBuf := make([]byte, 4096)
+			n := runtime.Stack(stackBuf, false)
+			gui.ShowFatalError("NanoDesk - 系統致命錯誤 (Panic)",
+				"應用程式發生未預期的崩潰例外：\n\n%v\n\n【呼叫堆疊資訊】:\n%s",
+				r, string(stackBuf[:n]))
+		}
+	}()
 
 	modeHTTPS := flag.Bool("https", false, "啟用記憶體自簽 HTTPS 模式 (預設為純 HTTP 模式)")
 	portFlag := flag.Int("port", 8080, "服務監聽埠號")
@@ -634,6 +643,23 @@ func main() {
 
 	port := *portFlag
 	addr := fmt.Sprintf(":%d", port)
+
+	// 0. 外部依賴檢查：Windows Media Foundation (mfplat.dll / mfreadwrite.dll)
+	if err := encoder.CheckMediaFoundationAvailable(); err != nil {
+		gui.ShowFatalError("NanoDesk - 缺少系統媒體元件", "%v", err)
+		return
+	}
+
+	// 1. 外部通訊檢查：預先驗證網路通訊埠是否被佔用
+	testLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		gui.ShowFatalError("NanoDesk - 通訊埠綁定失敗",
+			"無法監聽連接埠 %d：%v\n\n💡 可能原因：\n1. 該通訊埠已被其他程式（或前一次尚未完全結束的 NanoDesk）佔用。\n2. 防火牆或安全性原則阻止監聽。\n\n建議：請檢查工作管理員是否有殘留的 NanoDesk.exe，或在命令列加入 -port <其他埠號> 參數啟動。",
+			port, err)
+		return
+	}
+	testLn.Close()
+
 	ips := getLocalIPs()
 	primaryIP := "localhost"
 	if len(ips) > 0 {
@@ -645,10 +671,12 @@ func main() {
 	}
 	serverURL := fmt.Sprintf("%s://%s:%d", serverProtocol, primaryIP, port)
 
-	// 1. 建立串流中樞
+	// 2. 建立串流中樞 (DXGI / GDI 畫面擷取 + 螢幕檢測 + H.264 編碼器)
 	hub, err := newStreamHub()
 	if err != nil {
-		fmt.Printf("❌ 伺服器啟動失敗: %v\n", err)
+		gui.ShowFatalError("NanoDesk - 畫面擷取引擎啟動失敗",
+			"無法初始化桌面畫面擷取引擎：\n%v\n\n💡 常見排錯提示：\n1. 若您是在 Windows Server / 雲端虛擬機 (EC2/Azure/GCP) 運行，伺服器可能處於無螢幕 (Headless) 狀態，或遠端桌面 (RDP) 處於鎖定/斷開狀態。\n2. 系統未安裝相容之顯示卡驅動程式或不支援 DirectX 11 / GDI 桌面複製。\n3. 請確認伺服器有連接螢幕、或啟用虛擬螢幕 (Virtual Display Adapter)。",
+			err)
 		return
 	}
 	defer hub.capEngine.Close()
@@ -684,6 +712,7 @@ func main() {
 	// 4. 配置內嵌靜態資源 HTTP 路由
 	webSubFS, err := fs.Sub(embeddedWebFS, "web")
 	if err != nil {
+		gui.ShowFatalError("NanoDesk - 內嵌靜態資源解析失敗", "無法載入前端 Web 靜態資源目錄：%v", err)
 		return
 	}
 	http.Handle("/", http.FileServer(http.FS(webSubFS)))
@@ -930,7 +959,7 @@ func main() {
 		// HTTPS 模式
 		cert, err := generateMemoryCertificate()
 		if err != nil {
-			fmt.Printf("❌ 生成記憶體 TLS 憑證失敗: %v\n", err)
+			gui.ShowFatalError("NanoDesk - TLS 憑證生成失敗", "無法生成記憶體自簽 TLS 憑證：%v", err)
 			return
 		}
 
@@ -948,8 +977,8 @@ func main() {
 		}
 		fmt.Println("\n按下 Ctrl+C 可停止服務。")
 
-		if err := server.ListenAndServeTLS("", ""); err != nil {
-			fmt.Printf("❌ HTTPS 監聽錯誤: %v\n", err)
+		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+			gui.ShowFatalError("NanoDesk - HTTPS 服務異常中止", "HTTPS 伺服器監聽發生錯誤：%v", err)
 		}
 	} else {
 		// 預設：純 HTTP 模式 (零憑證問題，連線暢通無阻)
@@ -964,8 +993,8 @@ func main() {
 		fmt.Printf("   將其設為 Enabled，填入: http://[上述筆電網址]:%d ，重啟瀏覽器即可！\n", port)
 		fmt.Println("\n按下 Ctrl+C 可停止服務。")
 
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			fmt.Printf("❌ HTTP 監聽錯誤: %v\n", err)
+		if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
+			gui.ShowFatalError("NanoDesk - HTTP 服務異常中止", "HTTP 伺服器監聽發生錯誤：%v", err)
 		}
 	}
 }

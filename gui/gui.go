@@ -98,9 +98,12 @@ const (
 
 	COLOR_WINDOW     = 5
 	COLOR_BTNFACE    = 15
-
 	MB_OK            = 0x00000000
+	MB_ICONERROR     = 0x00000010
 	MB_ICONINFO      = 0x00000040
+	MB_SYSTEMMODAL   = 0x00001000
+	MB_SETFOREGROUND = 0x00010000
+	MB_TOPMOST       = 0x00040000
 
 	WM_SETICON       = 0x0080
 	ICON_SMALL       = 0
@@ -178,12 +181,29 @@ type HostGUI struct {
 
 var globalGUI *HostGUI
 
-// HideConsoleWindow 隱藏黑底終端機視窗，達成純 Windows GUI 體驗
+// ShowFatalError 彈出最高層級系統致命錯誤對話框 (置頂與系統強制焦點)，按下確定後直接退出
+func ShowFatalError(title, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	pTitle, _ := syscall.UTF16PtrFromString(title)
+	pMsg, _ := syscall.UTF16PtrFromString(msg)
+	flags := MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST
+	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(pMsg)), uintptr(unsafe.Pointer(pTitle)), uintptr(flags))
+	os.Exit(1)
+}
+
+// ShowErrorMessage 彈出系統錯誤提示對話框 (置頂與系統強制焦點)，但不退出程式
+func ShowErrorMessage(title, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	pTitle, _ := syscall.UTF16PtrFromString(title)
+	pMsg, _ := syscall.UTF16PtrFromString(msg)
+	flags := MB_OK | MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_TOPMOST
+	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(pMsg)), uintptr(unsafe.Pointer(pTitle)), uintptr(flags))
+}
+
+// HideConsoleWindow 在純 GUI 模式下廢除隱藏終端機，避免誤將使用者執行的 PowerShell 隱藏
 func HideConsoleWindow() {
-	hwnd, _, _ := procGetConsoleWindow.Call()
-	if hwnd != 0 {
-		procShowWindow.Call(hwnd, uintptr(SW_HIDE))
-	}
+	// 在純 Windows GUI 編譯旗標 (-ldflags "-H windowsgui") 下，Windows 預設不分配控制台。
+	// 此處保留函式以相容呼叫端，但不再呼叫 ShowWindow(hwnd, SW_HIDE) 以免誤關父控制台。
 }
 
 // 建立並啟動被控端原生 GUI 視窗
@@ -418,6 +438,11 @@ func (g *HostGUI) runWindowLoop() {
 		100, 100, 480, 400,
 		0, 0, hInstance, 0,
 	)
+
+	if hwnd == 0 {
+		ShowFatalError("NanoDesk - 視窗建立失敗", "無法建立 Win32 主視窗。\n請確認作業系統是否處於支援桌面工作階段 (Desktop Session) 之環境。")
+		return
+	}
 
 	g.hwnd = hwnd
 
