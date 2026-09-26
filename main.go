@@ -1215,13 +1215,47 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 			}
 		}
 
-	case "clipboard_image_upload":
+	case "clipboard_paste":
+		if client.role < auth.RoleStandard {
+			return
+		}
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
+			return
+		}
+		if txt, ok := cmd["text"].(string); ok && txt != "" {
+			clipboard.WriteText(txt)
+			// 保證 Windows 剪貼簿寫入完成 (25ms)，緊接著精確觸發一次 Ctrl+V 貼上
+			time.Sleep(25 * time.Millisecond)
+			h.inputCtrl.SendKey(0x11, true)  // VK_CONTROL
+			h.inputCtrl.SendKey(0x56, true)  // VK_V
+			time.Sleep(10 * time.Millisecond)
+			h.inputCtrl.SendKey(0x56, false)
+			h.inputCtrl.SendKey(0x11, false)
+		}
+
+	case "clipboard_image_paste", "clipboard_image_upload":
 		if client.role < auth.RoleStandard {
 			return // 僅觀看者禁止上傳截圖
+		}
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
+			return
 		}
 		if b64, ok := cmd["data"].(string); ok && b64 != "" {
 			if imgBytes, err := base64.StdEncoding.DecodeString(b64); err == nil {
 				clipboard.WriteImagePNG(imgBytes)
+				// 若為使用者按 Ctrl+V 的主動貼上請求，觸發一次 Ctrl+V 貼上
+				if cmdType == "clipboard_image_paste" {
+					time.Sleep(30 * time.Millisecond)
+					h.inputCtrl.SendKey(0x11, true)  // VK_CONTROL
+					h.inputCtrl.SendKey(0x56, true)  // VK_V
+					time.Sleep(10 * time.Millisecond)
+					h.inputCtrl.SendKey(0x56, false)
+					h.inputCtrl.SendKey(0x11, false)
+				}
 			}
 		}
 

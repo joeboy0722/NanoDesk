@@ -681,8 +681,10 @@
         }
 
         if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
-            syncClipboardText();
-            checkAndSyncLocalClipboardImage();
+            // 攔截 Ctrl+V 的立即按鍵直發！
+            // 避免在遠端剪貼簿尚未更新前就搶先觸發貼上 (導致第一次貼出舊內容)。
+            // 讓瀏覽器自然冒泡觸發 paste 事件，先寫入剪貼簿再精準觸發貼上！
+            return;
         }
 
         sendControl({
@@ -695,6 +697,10 @@
     window.addEventListener('keyup', (e) => {
         if (currentRole < 2) return;
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+
+        if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
+            return;
+        }
 
         sendControl({
             type: 'key',
@@ -777,28 +783,49 @@
         });
     });
 
-    // 11. 圖片剪貼簿貼上事件備援 (監聽本機複製圖片並在 KVM 視窗按下 Ctrl+V)
+    // 11. 剪貼簿貼上事件 (監聽在控制端畫面按下 Ctrl+V，同時支援文字與圖片同步至遠端主機)
     window.addEventListener('paste', (e) => {
-        if (!controlEnabled) return;
-        const items = e.clipboardData && e.clipboardData.items;
-        if (!items) return;
+        if (currentRole < 2) return;
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
 
-        for (let i = 0; i < items.length; i++) {
-            if (items[i].type.startsWith('image/')) {
-                const blob = items[i].getAsFile();
-                if (blob) {
-                    const reader = new FileReader();
-                    reader.onload = () => {
-                        const base64 = reader.result.split(',')[1];
-                        sendControl({
-                            type: 'clipboard_image_upload',
-                            data: base64
-                        });
-                        showToast('🖼️ 截圖已同步至遠端剪貼簿 (正在貼上)');
-                    };
-                    reader.readAsDataURL(blob);
-                    break;
+        const clipboardData = e.clipboardData;
+        if (!clipboardData) return;
+
+        // 1. 優先檢查是否為圖片
+        const items = clipboardData.items;
+        let hasImage = false;
+        if (items) {
+            for (let i = 0; i < items.length; i++) {
+                if (items[i].type.startsWith('image/')) {
+                    const blob = items[i].getAsFile();
+                    if (blob) {
+                        hasImage = true;
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                            const base64 = reader.result.split(',')[1];
+                            sendControl({
+                                type: 'clipboard_image_paste',
+                                data: base64
+                            });
+                            showToast('🖼️ 截圖已傳送至遠端並貼上');
+                        };
+                        reader.readAsDataURL(blob);
+                        break;
+                    }
                 }
+            }
+        }
+
+        // 2. 若非圖片，則提取純文字發送 clipboard_paste (先寫入剪貼簿再觸發貼上)
+        if (!hasImage) {
+            const text = clipboardData.getData('text');
+            if (text) {
+                lastSyncedText = text;
+                sendControl({
+                    type: 'clipboard_paste',
+                    text: text
+                });
+                showToast('📋 已將剪貼簿文字傳送並貼上');
             }
         }
     });
