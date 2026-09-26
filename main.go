@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kvm/auth"
@@ -45,28 +46,101 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-// Client 客戶端連線結構 (具備獨立存取權限與身分 Token)
+// 協同使用者專屬色盤 (用於指針與成員徽章辨識)
+var userColors = []string{
+	"#3b82f6", // 經典藍
+	"#10b981", // 翡翠綠
+	"#f59e0b", // 琥珀橙
+	"#ec4899", // 霓虹粉
+	"#8b5cf6", // 幻紫
+	"#06b6d4", // 青藍
+	"#f97316", // 珊瑚橘
+	"#14b8a6", // 湖水綠
+}
+var clientSeq uint64
+
+// Client 客戶端連線結構 (具備獨立存取權限、身分 Token 與多人協同狀態)
 type Client struct {
-	conn   *websocket.Conn
-	mu     sync.Mutex
-	ip     string
-	token  string
-	role   auth.Role
-	authed bool
+	conn      *websocket.Conn
+	mu        sync.Mutex
+	id        string
+	name      string
+	color     string
+	ip        string
+	token     string
+	role      auth.Role
+	authed    bool
+	connected time.Time
+	sendChan  chan []byte // 視訊畫面封包非阻塞緩衝管道 (容量 10 幀)
+	closeOnce sync.Once
 }
 
-// 串流中樞管理器
+// 安全發送 JSON 控制文字訊息 (獨立逾時保護，不阻塞其他協程)
+func (c *Client) safeSendJSON(msg interface{}) error {
+	bytes, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+	return c.conn.WriteMessage(websocket.TextMessage, bytes)
+}
+
+// 每個 Client 專屬的寫入幫浦 (由單一協程管理連線寫入與 Ping 心跳，杜絕並發競爭與死鎖)
+func (c *Client) writePump(h *StreamHub) {
+	ticker := time.NewTicker(800 * time.Millisecond) // 每 800ms 心跳保活 (低於 1 秒微弱閾值)
+	defer func() {
+		ticker.Stop()
+		h.unregisterClient(c)
+	}()
+
+	for {
+		select {
+		case data, ok := <-c.sendChan:
+			if !ok {
+				c.mu.Lock()
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.mu.Unlock()
+				return
+			}
+			c.mu.Lock()
+			c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			err := c.conn.WriteMessage(websocket.BinaryMessage, data)
+			c.mu.Unlock()
+			if err != nil {
+				return
+			}
+
+		case <-ticker.C:
+			c.mu.Lock()
+			// 1. 發送標準底層 WebSocket Ping 封包
+			err1 := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(2*time.Second))
+			// 2. 同步發送應用層心跳 (供前端 JavaScript 秒級敏銳斷線感知)
+			c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			err2 := c.conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"ping"}`))
+			c.mu.Unlock()
+			if err1 != nil || err2 != nil {
+				return
+			}
+		}
+	}
+}
+
+// 串流中樞管理器 (支援多人協同、輸入租約鎖與雷射筆廣播)
 type StreamHub struct {
-	mu             sync.Mutex
-	clients        map[*Client]bool
-	capEngine      capture.Capturer
-	monitors       []capture.Monitor
-	currentMonitor int
-	encoder        *encoder.H264Encoder
-	requestKeyNext bool
-	inputCtrl      *input.InputController
-	authMgr        *auth.AuthManager
-	hostGUI        *gui.HostGUI
+	mu                sync.Mutex
+	clients           map[*Client]bool
+	capEngine         capture.Capturer
+	monitors          []capture.Monitor
+	currentMonitor    int
+	encoder           *encoder.H264Encoder
+	requestKeyNext    bool
+	inputCtrl         *input.InputController
+	authMgr           *auth.AuthManager
+	hostGUI           *gui.HostGUI
+	currentController *Client
+	controllerExpiry  time.Time
 }
 
 func newStreamHub() (*StreamHub, error) {
@@ -152,43 +226,60 @@ func (h *StreamHub) registerClient(c *Client) {
 
 // 發送初始化資訊給指定已驗證客戶端
 func (h *StreamHub) sendInitInfo(c *Client) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	// 1. 發送授權成功通知與身分角色
-	authMsg := map[string]interface{}{
+	c.safeSendJSON(map[string]interface{}{
 		"type":      "auth_success",
 		"role":      int(c.role),
 		"role_name": c.role.String(),
-	}
-	authBytes, _ := json.Marshal(authMsg)
-	c.conn.WriteMessage(websocket.TextMessage, authBytes)
+	})
 
-	// 2. 發送所有螢幕清單
-	initMsg := map[string]interface{}{
-		"type":     "init",
-		"monitors": h.monitors,
-		"current":  h.currentMonitor,
-	}
-	initBytes, _ := json.Marshal(initMsg)
-	c.conn.WriteMessage(websocket.TextMessage, initBytes)
-
-	// 3. 立即請求產出關鍵幀 (IDR)，達成秒開畫面！
+	// 2. 獲取螢幕資訊並請求 IDR 關鍵幀 (獨立 h.mu，不與 c.mu 嵌套)
 	h.mu.Lock()
+	monitors := h.monitors
+	curMon := h.currentMonitor
 	if h.encoder != nil {
 		h.encoder.RequestKeyframe()
 	}
 	h.mu.Unlock()
+
+	c.safeSendJSON(map[string]interface{}{
+		"type":     "init",
+		"monitors": monitors,
+		"current":  curMon,
+	})
+
+	// 3. 發送客戶端自身協同身分資訊 (ID、預設名稱、專屬標籤顏色)
+	c.safeSendJSON(map[string]interface{}{
+		"type":  "my_info",
+		"id":    c.id,
+		"name":  c.name,
+		"color": c.color,
+	})
+
+	// 4. 異步向所有在線成員廣播最新成員列表與當前控制權狀態
+	go h.broadcastMembersUpdate()
+	go h.broadcastControlState()
 }
 
 // 移除客戶端
 func (h *StreamHub) unregisterClient(c *Client) {
 	h.mu.Lock()
+	if !h.clients[c] {
+		h.mu.Unlock()
+		return // 防止重複清理
+	}
 	delete(h.clients, c)
 	count := len(h.clients)
+	if h.currentController == c {
+		h.currentController = nil
+		h.controllerExpiry = time.Time{}
+	}
 	h.mu.Unlock()
 
-	c.conn.Close()
+	c.closeOnce.Do(func() {
+		close(c.sendChan)
+		c.conn.Close()
+	})
 
 	if h.inputCtrl != nil {
 		h.inputCtrl.ReleaseAllKeys()
@@ -197,16 +288,29 @@ func (h *StreamHub) unregisterClient(c *Client) {
 	if h.hostGUI != nil {
 		h.hostGUI.UpdateClientStats(count, "")
 	}
+
+	go h.broadcastMembersUpdate()
+	go h.broadcastControlState()
 }
 
 // 一鍵緊急踢除並斷開所有遠端客戶端
 func (h *StreamHub) kickAllClients() {
 	h.mu.Lock()
+	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		c.conn.Close()
+		clients = append(clients, c)
 		delete(h.clients, c)
 	}
+	h.currentController = nil
+	h.controllerExpiry = time.Time{}
 	h.mu.Unlock()
+
+	for _, c := range clients {
+		c.closeOnce.Do(func() {
+			close(c.sendChan)
+			c.conn.Close()
+		})
+	}
 
 	if h.inputCtrl != nil {
 		h.inputCtrl.ReleaseAllKeys()
@@ -214,6 +318,170 @@ func (h *StreamHub) kickAllClients() {
 
 	if h.hostGUI != nil {
 		h.hostGUI.UpdateClientStats(0, "")
+	}
+}
+
+// 嘗試獲取或續約控制權 (同一時間僅有一人能真正注入輸入)
+func (h *StreamHub) tryAcquireControl(c *Client) (bool, string) {
+	if c.role < auth.RoleStandard {
+		return false, "您目前僅有觀看權限，無法進行控制"
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	now := time.Now()
+	// 若尚無主控者，或當前主控者租約已逾期
+	if h.currentController == nil || now.After(h.controllerExpiry) {
+		h.currentController = c
+		h.controllerExpiry = now.Add(2 * time.Second)
+		go h.broadcastControlState()
+		go h.broadcastMembersUpdate()
+		return true, ""
+	}
+
+	// 若當前主控者即為自己，則直接續約 2 秒
+	if h.currentController == c {
+		h.controllerExpiry = now.Add(2 * time.Second)
+		return true, ""
+	}
+
+	// 若當前主控者為其他人，但自己是 RoleAdmin 而對方只是 RoleStandard，管理員可強制覆蓋接管
+	if c.role >= auth.RoleAdmin && h.currentController.role < auth.RoleAdmin {
+		h.currentController = c
+		h.controllerExpiry = now.Add(2 * time.Second)
+		go h.broadcastControlState()
+		go h.broadcastMembersUpdate()
+		return true, ""
+	}
+
+	// 被其他人控制中
+	return false, fmt.Sprintf("目前由【%s】控制中", h.currentController.name)
+}
+
+// 主動釋放控制權 (讓其他人可立即接手)
+func (h *StreamHub) releaseControl(c *Client) {
+	h.mu.Lock()
+	if h.currentController == c {
+		h.currentController = nil
+		h.controllerExpiry = time.Time{}
+		h.mu.Unlock()
+		go h.broadcastControlState()
+		go h.broadcastMembersUpdate()
+		return
+	}
+	h.mu.Unlock()
+}
+
+// 廣播協同雷射指針 (當未持有主控權的使用者滑動滑鼠時)
+func (h *StreamHub) broadcastLaser(sender *Client, x, y float64) {
+	msg := map[string]interface{}{
+		"type":  "laser_pointer",
+		"id":    sender.id,
+		"name":  sender.name,
+		"color": sender.color,
+		"x":     x,
+		"y":     y,
+	}
+
+	h.mu.Lock()
+	clients := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		if c.authed && c.role >= auth.RoleView && c != sender {
+			clients = append(clients, c)
+		}
+	}
+	h.mu.Unlock()
+
+	for _, c := range clients {
+		go c.safeSendJSON(msg)
+	}
+}
+
+// 廣播當前控制權狀態與主控者資訊
+func (h *StreamHub) broadcastControlState() {
+	h.mu.Lock()
+	var ctrlID, ctrlName, ctrlColor string
+	var isFree = true
+	var remainMs int64
+	if h.currentController != nil && time.Now().Before(h.controllerExpiry) {
+		ctrlID = h.currentController.id
+		ctrlName = h.currentController.name
+		ctrlColor = h.currentController.color
+		remainMs = h.controllerExpiry.Sub(time.Now()).Milliseconds()
+		isFree = false
+	}
+	clients := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		if c.authed {
+			clients = append(clients, c)
+		}
+	}
+	h.mu.Unlock()
+
+	msg := map[string]interface{}{
+		"type":             "control_state",
+		"is_free":          isFree,
+		"controller_id":    ctrlID,
+		"controller_name":  ctrlName,
+		"controller_color": ctrlColor,
+		"remain_ms":        remainMs,
+	}
+
+	for _, c := range clients {
+		go c.safeSendJSON(msg)
+	}
+}
+
+// 廣播最新在線成員清單
+func (h *StreamHub) broadcastMembersUpdate() {
+	h.mu.Lock()
+	type MemberInfo struct {
+		ID           string `json:"id"`
+		Name         string `json:"name"`
+		Color        string `json:"color"`
+		IP           string `json:"ip"`
+		Role         int    `json:"role"`
+		RoleName     string `json:"role_name"`
+		IsController bool   `json:"is_controller"`
+	}
+
+	var members []MemberInfo
+	var latestIP string
+	clients := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		if !c.authed {
+			continue
+		}
+		clients = append(clients, c)
+		isCtrl := (h.currentController == c && time.Now().Before(h.controllerExpiry))
+		members = append(members, MemberInfo{
+			ID:           c.id,
+			Name:         c.name,
+			Color:        c.color,
+			IP:           c.ip,
+			Role:         int(c.role),
+			RoleName:     c.role.String(),
+			IsController: isCtrl,
+		})
+		latestIP = c.ip
+	}
+	count := len(members)
+	h.mu.Unlock()
+
+	msg := map[string]interface{}{
+		"type":    "members_update",
+		"members": members,
+		"count":   count,
+	}
+
+	for _, c := range clients {
+		go c.safeSendJSON(msg)
+	}
+
+	// 同步更新原生 Win32 GUI 狀態文字
+	if h.hostGUI != nil {
+		h.hostGUI.UpdateClientStats(count, latestIP)
 	}
 }
 
@@ -244,21 +512,23 @@ func (h *StreamHub) requestKeyframe() {
 	}
 }
 
-// 廣播二進位視訊流封包至所有客戶端 (只有 RoleView 以上且已驗證者方可接收畫面)
+// 廣播二進位視訊流封包至所有客戶端 (快照派發，非阻塞零等待)
 func (h *StreamHub) broadcast(data []byte) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
+	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if !c.authed || c.role < auth.RoleView {
-			continue // 未通過密碼或核准授權前，絕不推流畫面！保護被控端隱私
+		if c.authed && c.role >= auth.RoleView {
+			clients = append(clients, c)
 		}
-		c.mu.Lock()
-		c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		err := c.conn.WriteMessage(websocket.BinaryMessage, data)
-		c.mu.Unlock()
-		if err != nil {
-			go h.unregisterClient(c)
+	}
+	h.mu.Unlock()
+
+	// 零鎖非阻塞派發至各客戶端的專屬緩衝通道
+	for _, c := range clients {
+		select {
+		case c.sendChan <- data:
+		default:
+			// 隊列滿代表該客戶端當前網路延遲/擁塞，自動丟棄過期舊幀防積壓，絕不拖累伺服器與其他人！
 		}
 	}
 }
@@ -269,19 +539,17 @@ func (h *StreamHub) broadcastClipboard(text string) {
 		"type": "clipboard_sync",
 		"text": text,
 	}
-	bytes, _ := json.Marshal(msg)
-
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
+	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if !c.authed || c.role < auth.RoleStandard {
-			continue // 僅觀看者不接收剪貼簿
+		if c.authed && c.role >= auth.RoleStandard {
+			clients = append(clients, c)
 		}
-		c.mu.Lock()
-		c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		c.conn.WriteMessage(websocket.TextMessage, bytes)
-		c.mu.Unlock()
+	}
+	h.mu.Unlock()
+
+	for _, c := range clients {
+		go c.safeSendJSON(msg)
 	}
 }
 
@@ -292,19 +560,17 @@ func (h *StreamHub) broadcastClipboardImage(pngBytes []byte) {
 		"type": "clipboard_image_sync",
 		"data": b64,
 	}
-	bytes, _ := json.Marshal(msg)
-
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
+	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if !c.authed || c.role < auth.RoleStandard {
-			continue // 僅觀看者不接收剪貼簿圖片
+		if c.authed && c.role >= auth.RoleStandard {
+			clients = append(clients, c)
 		}
-		c.mu.Lock()
-		c.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
-		c.conn.WriteMessage(websocket.TextMessage, bytes)
-		c.mu.Unlock()
+	}
+	h.mu.Unlock()
+
+	for _, c := range clients {
+		go c.safeSendJSON(msg)
 	}
 }
 
@@ -603,12 +869,26 @@ func main() {
 			clientIP = r.RemoteAddr
 		}
 
+		seq := atomic.AddUint64(&clientSeq, 1)
+		color := userColors[(seq-1)%uint64(len(userColors))]
+		clientID := fmt.Sprintf("C%d", seq)
+		shortIP := clientIP
+		if len(shortIP) > 15 {
+			shortIP = shortIP[:15]
+		}
+		defaultName := fmt.Sprintf("成員-%d (%s)", seq, shortIP)
+
 		client := &Client{
-			conn:   conn,
-			ip:     clientIP,
-			token:  token,
-			role:   auth.RoleNone,
-			authed: false,
+			conn:      conn,
+			id:        clientID,
+			name:      defaultName,
+			color:     color,
+			ip:        clientIP,
+			token:     token,
+			role:      auth.RoleNone,
+			authed:    false,
+			connected: time.Now(),
+			sendChan:  make(chan []byte, 10),
 		}
 
 		// 若已自帶合法 Token 則直接賦權
@@ -621,6 +901,9 @@ func main() {
 
 		hub.registerClient(client)
 
+		// 啟動專屬非阻塞寫入與 Ping 心跳協程
+		go client.writePump(hub)
+
 		// 設定初始讀取逾時與 Pong 回應處理
 		conn.SetReadLimit(10 * 1024 * 1024)
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -629,31 +912,10 @@ func main() {
 			return nil
 		})
 
-		// 啟動定時 Ping 心跳協程保活連線，防止路由器或防火牆 NAT 逾時切斷
-		stopPing := make(chan struct{})
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					client.mu.Lock()
-					err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(3*time.Second))
-					client.mu.Unlock()
-					if err != nil {
-						return
-					}
-				case <-stopPing:
-					return
-				}
-			}
-		}()
-
 		// 監聽客戶端上行控制指令
 		for {
 			_, msgBytes, err := conn.ReadMessage()
 			if err != nil {
-				close(stopPing)
 				hub.unregisterClient(client)
 				break
 			}
@@ -802,9 +1064,7 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 					return
 				}
 			}
-			client.mu.Lock()
-			client.conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"auth_fail","message":"Token 無效或已過期"}`))
-			client.mu.Unlock()
+			client.safeSendJSON(map[string]interface{}{"type": "auth_fail", "message": "Token 無效或已過期"})
 
 		case "auth_login":
 			if pwd, ok := cmd["password"].(string); ok {
@@ -818,14 +1078,12 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 					return
 				}
 			}
-			client.mu.Lock()
-			client.conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"auth_fail","message":"密碼錯誤，請重新輸入"}`))
-			client.mu.Unlock()
+			client.safeSendJSON(map[string]interface{}{"type": "auth_fail", "message": "密碼錯誤，請重新輸入"})
 		}
 		return // 未授權前拋棄所有其他操作
 	}
 
-	// 2. 根據客戶端當前授權之角色 (Role) 實施嚴格功能過濾
+	// 2. 根據客戶端當前授權之角色 (Role) 實施嚴格功能過濾與多人租約仲裁
 	switch cmdType {
 	case "mouse_move":
 		if client.role < auth.RoleStandard {
@@ -834,15 +1092,28 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		x, okX := cmd["x"].(float64)
 		y, okY := cmd["y"].(float64)
 		if okX && okY {
-			h.mu.Lock()
-			mon := h.monitors[h.currentMonitor]
-			h.mu.Unlock()
-			h.inputCtrl.MoveMouseAbsolute(mon.X, mon.Y, mon.Width, mon.Height, x, y)
+			// 檢查是否取得/持有主控權
+			acquired, _ := h.tryAcquireControl(client)
+			if acquired {
+				// 持有主控權：真正注入 Windows 滑鼠座標
+				h.mu.Lock()
+				mon := h.monitors[h.currentMonitor]
+				h.mu.Unlock()
+				h.inputCtrl.MoveMouseAbsolute(mon.X, mon.Y, mon.Width, mon.Height, x, y)
+			} else {
+				// 未持有主控權：轉為協同彩色雷射筆指針廣播，不擾動作業系統游標
+				h.broadcastLaser(client, x, y)
+			}
 		}
 
 	case "mouse_button":
 		if client.role < auth.RoleStandard {
 			return // 僅觀看者禁止滑鼠點擊
+		}
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
+			return
 		}
 		btn, okB := cmd["button"].(float64)
 		isDown, okD := cmd["isDown"].(bool)
@@ -854,6 +1125,11 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		if client.role < auth.RoleStandard {
 			return // 僅觀看者禁止滾輪
 		}
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
+			return
+		}
 		dx, _ := cmd["deltaX"].(float64)
 		dy, _ := cmd["deltaY"].(float64)
 		h.inputCtrl.MouseWheel(int(dx), int(dy))
@@ -861,6 +1137,11 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 	case "key":
 		if client.role < auth.RoleStandard {
 			return // 僅觀看者禁止鍵盤輸入
+		}
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
+			return
 		}
 		code, okC := cmd["code"].(string)
 		isDown, okD := cmd["isDown"].(bool)
@@ -873,6 +1154,28 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 	case "release_all_keys":
 		if client.role >= auth.RoleStandard {
 			h.inputCtrl.ReleaseAllKeys()
+		}
+
+	case "take_control":
+		// 主動接管或申請控制權
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
+		}
+
+	case "release_control":
+		// 主動釋放控制權
+		h.releaseControl(client)
+
+	case "rename":
+		// 成員自訂暱稱
+		if name, ok := cmd["name"].(string); ok && name != "" {
+			if len(name) > 20 {
+				name = name[:20]
+			}
+			client.name = name
+			go h.broadcastMembersUpdate()
+			go h.broadcastControlState()
 		}
 
 	case "clipboard_sync":
@@ -898,14 +1201,10 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 
 	case "clipboard_get":
 		txt, _ := clipboard.ReadText()
-		res := map[string]interface{}{
+		client.safeSendJSON(map[string]interface{}{
 			"type": "clipboard_data",
 			"text": txt,
-		}
-		resBytes, _ := json.Marshal(res)
-		client.mu.Lock()
-		client.conn.WriteMessage(websocket.TextMessage, resBytes)
-		client.mu.Unlock()
+		})
 
 	case "clipboard_set":
 		if client.role < auth.RoleStandard {
@@ -917,6 +1216,11 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 
 	case "type_text":
 		if client.role < auth.RoleStandard {
+			return
+		}
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
 			return
 		}
 		if txt, ok := cmd["text"].(string); ok {
@@ -934,6 +1238,11 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 			if client.role < auth.RoleStandard {
 				return
 			}
+		}
+		acquired, reason := h.tryAcquireControl(client)
+		if !acquired {
+			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
+			return
 		}
 		h.handleSpecialKey(keyName)
 

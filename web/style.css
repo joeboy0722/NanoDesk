@@ -74,6 +74,7 @@ body {
     height: 8px;
     border-radius: 50%;
     display: inline-block;
+    transition: background-color 0.2s, box-shadow 0.2s;
 }
 
 .dot.connected {
@@ -81,9 +82,26 @@ body {
     box-shadow: 0 0 8px #2ea043;
 }
 
+.dot.warning {
+    background-color: #f59e0b;
+    box-shadow: 0 0 8px #f59e0b;
+    animation: dot-pulse-warning 0.9s infinite alternate ease-in-out;
+}
+
 .dot.disconnected {
     background-color: #f85149;
     box-shadow: 0 0 8px #f85149;
+}
+
+@keyframes dot-pulse-warning {
+    from {
+        opacity: 0.6;
+        transform: scale(0.85);
+    }
+    to {
+        opacity: 1;
+        transform: scale(1.2);
+    }
 }
 
 /* 螢幕選單下拉框 */
@@ -579,4 +597,273 @@ select:hover {
 
 @keyframes spin {
     to { transform: rotate(360deg); }
+}
+
+/* ==========================================================================
+   多人協同控制與雷射指示筆樣式
+   ========================================================================== */
+
+/* 頂部多人協同組件 */
+.collab-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.control-badge {
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    transition: all 0.2s ease;
+}
+
+.control-badge.free {
+    background-color: rgba(35, 134, 54, 0.2);
+    color: #3fb950;
+    border: 1px solid rgba(35, 134, 54, 0.4);
+}
+
+.control-badge.busy {
+    background-color: rgba(218, 54, 51, 0.2);
+    color: #f85149;
+    border: 1px solid rgba(218, 54, 51, 0.4);
+}
+
+.control-badge.me {
+    background-color: rgba(31, 111, 235, 0.25);
+    color: #58a6ff;
+    border: 1px solid rgba(31, 111, 235, 0.5);
+    box-shadow: 0 0 8px rgba(88, 166, 255, 0.3);
+}
+
+.btn-ctrl {
+    background-color: #21262d;
+    border: 1px solid #30363d;
+    color: #58a6ff;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-ctrl:hover {
+    background-color: #30363d;
+    border-color: #58a6ff;
+}
+
+.btn-users {
+    background-color: #21262d;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.btn-users:hover {
+    background-color: #30363d;
+    color: #ffffff;
+}
+
+/* 協同彩色雷射筆指針容器 (覆蓋在畫布上，不阻斷滑鼠事件 pointer-events: none) */
+.laser-container {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    overflow: hidden;
+    z-index: 50;
+}
+
+.laser-pointer {
+    position: absolute;
+    pointer-events: none;
+    transition: left 0.04s linear, top 0.04s linear, opacity 0.3s ease;
+    transform: translate(-2px, -2px);
+    z-index: 51;
+}
+
+.laser-pointer.fade-out {
+    opacity: 0;
+}
+
+/* 雷射指針游標光點/箭頭 */
+.laser-cursor {
+    width: 18px;
+    height: 18px;
+    filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.8));
+}
+
+.laser-cursor svg {
+    width: 100%;
+    height: 100%;
+}
+
+/* 指針旁邊的名稱標籤 */
+.laser-tag {
+    position: absolute;
+    left: 14px;
+    top: 14px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    color: #ffffff;
+    white-space: nowrap;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.6);
+    pointer-events: none;
+    user-select: none;
+}
+
+/* 在線成員懸浮面板 */
+.members-modal {
+    position: absolute;
+    top: 50px;
+    right: 20px;
+    width: 280px;
+    background-color: #161b22;
+    border: 1px solid #30363d;
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
+    z-index: 100;
+    padding: 12px;
+}
+
+.members-modal.hidden {
+    display: none;
+}
+
+.members-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #21262d;
+    padding-bottom: 8px;
+    margin-bottom: 10px;
+}
+
+.members-header h3 {
+    font-size: 13px;
+    color: #e6edf3;
+    margin: 0;
+}
+
+.btn-close {
+    background: none;
+    border: none;
+    color: #8b949e;
+    font-size: 18px;
+    cursor: pointer;
+    line-height: 1;
+}
+
+.btn-close:hover {
+    color: #f85149;
+}
+
+.my-profile-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px dashed #21262d;
+}
+
+.my-color-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.my-profile-row input {
+    flex: 1;
+    background-color: #0d1117;
+    border: 1px solid #30363d;
+    color: #c9d1d9;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.my-profile-row input:focus {
+    outline: none;
+    border-color: #58a6ff;
+}
+
+.btn-sm {
+    padding: 4px 8px;
+    font-size: 11px;
+}
+
+.members-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.member-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 4px;
+    border-radius: 4px;
+    font-size: 12px;
+}
+
+.member-item:hover {
+    background-color: #21262d;
+}
+
+.member-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow: hidden;
+}
+
+.member-color-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.member-name {
+    color: #e6edf3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 130px;
+}
+
+.member-role {
+    font-size: 10px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background-color: #30363d;
+    color: #8b949e;
+}
+
+.member-role.admin {
+    background-color: rgba(218, 54, 51, 0.2);
+    color: #f85149;
+}
+
+.member-role.std {
+    background-color: rgba(31, 111, 235, 0.2);
+    color: #58a6ff;
+}
+
+.member-badge-ctrl {
+    font-size: 11px;
+    margin-left: 4px;
 }

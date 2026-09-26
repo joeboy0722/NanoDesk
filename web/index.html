@@ -39,6 +39,13 @@
                 <button class="btn btn-shortcut btn-admin" data-key="ctrl_shift_esc" title="開啟工作管理員">工作管理員</button>
                 <button class="btn btn-shortcut btn-danger btn-admin" data-key="ctrl_alt_del" title="發送安全組合鍵">Ctrl+Alt+Del</button>
             </div>
+            <span class="divider"></span>
+            <!-- 多人協同控制狀態與在線成員 -->
+            <div id="collabGroup" class="collab-group">
+                <span id="controlStatusBadge" class="control-badge free" title="目前控制權狀態">🟢 自由控制</span>
+                <button id="controlActionBtn" class="btn btn-ctrl hidden" title="接管或讓出控制權">🎮 取得控制</button>
+                <button id="membersBtn" class="btn btn-users" title="查看在線協同成員">👥 <span id="onlineCount">1</span></button>
+            </div>
         </div>
 
         <div class="right-group">
@@ -53,6 +60,25 @@
     <main id="viewport">
         <!-- 原生 Canvas 渲染畫布 (支援鍵盤焦點) -->
         <canvas id="screenCanvas" tabindex="0"></canvas>
+
+        <!-- 多人協同彩色雷射指示筆圖層 (不干擾操作，直觀指向) -->
+        <div id="laserContainer" class="laser-container"></div>
+
+        <!-- 在線成員懸浮面板 (點擊 membersBtn 彈出) -->
+        <div id="membersModal" class="members-modal hidden">
+            <div class="members-header">
+                <h3>👥 在線成員 (<span id="membersModalCount">1</span>)</h3>
+                <button id="closeMembersBtn" class="btn-close">&times;</button>
+            </div>
+            <div class="my-profile-row">
+                <span class="my-color-dot" id="myColorDot"></span>
+                <input type="text" id="myNicknameInput" placeholder="設定我的暱稱" maxlength="16">
+                <button id="saveNicknameBtn" class="btn btn-sm btn-primary">儲存暱稱</button>
+            </div>
+            <ul id="membersList" class="members-list">
+                <!-- 動態注入成員清單 -->
+            </ul>
+        </div>
 
         <!-- 檔案拖曳懸浮遮罩 -->
         <div id="dropOverlay" class="drop-overlay hidden">

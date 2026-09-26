@@ -31,6 +31,20 @@
     const authPendingStatus = document.getElementById('authPendingStatus');
     const authPendingText = document.getElementById('authPendingText');
 
+    // 多人協同相關 DOM
+    const controlStatusBadge = document.getElementById('controlStatusBadge');
+    const controlActionBtn = document.getElementById('controlActionBtn');
+    const membersBtn = document.getElementById('membersBtn');
+    const onlineCount = document.getElementById('onlineCount');
+    const laserContainer = document.getElementById('laserContainer');
+    const membersModal = document.getElementById('membersModal');
+    const closeMembersBtn = document.getElementById('closeMembersBtn');
+    const myColorDot = document.getElementById('myColorDot');
+    const myNicknameInput = document.getElementById('myNicknameInput');
+    const saveNicknameBtn = document.getElementById('saveNicknameBtn');
+    const membersList = document.getElementById('membersList');
+    const membersModalCount = document.getElementById('membersModalCount');
+
     // 檢查瀏覽器是否支援 WebCodecs API
     if (!('VideoDecoder' in window)) {
         unsupportedOverlay.classList.remove('hidden');
@@ -50,6 +64,13 @@
     let lastImageKey = ''; // 記錄本機最新同步圖片的特徵 (大小+類型)，防止重覆上傳
     let reconnectTimer = null;
     let authPollingTimer = null;
+    let lastDataReceivedTime = performance.now(); // 記錄最後收到影像訊框或心跳控制訊息的時間戳記
+
+    // 多人協同狀態變數
+    let myInfo = { id: '', name: '', color: '#3b82f6' };
+    let controlState = { is_free: true, controller_id: '', controller_name: '', controller_color: '', remain_ms: 0 };
+    let members = [];
+    const laserPointers = {}; // 保存各使用者的雷射指針 DOM 與定時器
 
     // 依據授權身分角色套用前端介面自適應
     function applyRolePermissions(role, roleName) {
@@ -231,15 +252,15 @@
         frameCounter++;
     }
 
-    // 排程自動重新連線 (斷線後每 1.5 秒重試一次)
-    function scheduleReconnect() {
+    // 排程自動重新連線 (可指定 immediate 為 true 進行 150ms 急速重試)
+    function scheduleReconnect(immediate = false) {
         if (reconnectTimer) return;
         statusText.textContent = '連線中斷，正在自動重連...';
         statusDot.className = 'dot disconnected';
         reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
             connectWebSocket();
-        }, 1500);
+        }, immediate ? 150 : 1500);
     }
 
     // 3. 連接 WebSocket 伺服器
@@ -268,6 +289,7 @@
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = () => {
+            lastDataReceivedTime = performance.now();
             statusText.textContent = '已連線 (串流中)';
             statusDot.className = 'dot connected';
             initDecoder();
@@ -284,6 +306,9 @@
         };
 
         ws.onmessage = (event) => {
+            // 收到任何訊框或心跳文字封包，立即刷新存活時間戳記
+            lastDataReceivedTime = performance.now();
+
             if (typeof event.data === 'string') {
                 try {
                     const msg = JSON.parse(event.data);
@@ -302,6 +327,7 @@
 
     // 4. 處理二進位視訊數據封包
     function handleBinaryVideoData(arrayBuffer) {
+        lastDataReceivedTime = performance.now();
         const bytes = new Uint8Array(arrayBuffer);
         if (bytes.length < 5) return; // 協議最小長度：1(標誌) + 4(時間戳)
 
@@ -381,7 +407,96 @@
             } catch (e) {
                 console.error('[圖片剪貼簿解析失敗]', e);
             }
+        } else if (msg.type === 'my_info') {
+            myInfo = { id: msg.id, name: msg.name, color: msg.color };
+            if (myColorDot) myColorDot.style.backgroundColor = myInfo.color;
+            if (myNicknameInput && !myNicknameInput.value) myNicknameInput.value = myInfo.name;
+        } else if (msg.type === 'control_state') {
+            controlState = msg;
+            updateControlUI();
+        } else if (msg.type === 'members_update') {
+            members = msg.members || [];
+            if (onlineCount) onlineCount.textContent = msg.count || members.length;
+            if (membersModalCount) membersModalCount.textContent = msg.count || members.length;
+            renderMembersList();
+        } else if (msg.type === 'laser_pointer') {
+            renderLaserPointer(msg);
+        } else if (msg.type === 'control_denied') {
+            showToast(`⚠️ ${msg.message}`);
         }
+    }
+
+    // 更新頂部多人控制權狀態 UI
+    function updateControlUI() {
+        if (!controlStatusBadge || !controlActionBtn) return;
+        if (controlState.is_free) {
+            controlStatusBadge.className = 'control-badge free';
+            controlStatusBadge.textContent = '🟢 自由控制';
+            controlActionBtn.classList.add('hidden');
+        } else if (controlState.controller_id === myInfo.id) {
+            controlStatusBadge.className = 'control-badge me';
+            controlStatusBadge.textContent = '🎮 我正在控制中';
+            controlActionBtn.textContent = '讓出控制';
+            controlActionBtn.classList.remove('hidden');
+        } else {
+            controlStatusBadge.className = 'control-badge busy';
+            controlStatusBadge.textContent = `🔒 由 ${controlState.controller_name || '他人'} 控制中`;
+            controlActionBtn.textContent = '🎮 取得控制';
+            controlActionBtn.classList.remove('hidden');
+        }
+    }
+
+    // 渲染在線成員面板清單
+    function renderMembersList() {
+        if (!membersList) return;
+        membersList.innerHTML = '';
+        members.forEach(m => {
+            const li = document.createElement('li');
+            li.className = 'member-item';
+            const isMe = m.id === myInfo.id ? ' (我)' : '';
+            const ctrlBadge = m.is_controller ? '<span class="member-badge-ctrl" title="正在控制中">🎮</span>' : '';
+            const roleClass = m.role === 3 ? 'admin' : (m.role === 2 ? 'std' : 'view');
+
+            li.innerHTML = `
+                <div class="member-left">
+                    <span class="member-color-dot" style="background-color: ${m.color || '#3b82f6'}"></span>
+                    <span class="member-name" title="${m.name}">${m.name}${isMe}</span>
+                    ${ctrlBadge}
+                </div>
+                <span class="member-role ${roleClass}">${m.role_name}</span>
+            `;
+            membersList.appendChild(li);
+        });
+    }
+
+    // 渲染協同彩色雷射指示筆光標
+    function renderLaserPointer(msg) {
+        if (!laserContainer) return;
+        let p = laserPointers[msg.id];
+        if (!p) {
+            const el = document.createElement('div');
+            el.className = 'laser-pointer';
+            el.innerHTML = `
+                <div class="laser-cursor">
+                    <svg viewBox="0 0 24 24" fill="${msg.color || '#3b82f6'}">
+                        <path d="M4 2L20 10L12 12L10 20L4 2Z" stroke="#ffffff" stroke-width="1.5" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <div class="laser-tag" style="background-color: ${msg.color || '#3b82f6'}">${msg.name || '協同成員'}</div>
+            `;
+            laserContainer.appendChild(el);
+            p = { element: el, timer: null };
+            laserPointers[msg.id] = p;
+        }
+
+        p.element.style.left = `${msg.x * 100}%`;
+        p.element.style.top = `${msg.y * 100}%`;
+        p.element.classList.remove('fade-out');
+
+        if (p.timer) clearTimeout(p.timer);
+        p.timer = setTimeout(() => {
+            p.element.classList.add('fade-out');
+        }, 1800);
     }
 
     // 請求伺服器立即產生一個關鍵幀 (I 幀)
@@ -762,22 +877,100 @@
         }
     });
 
-    // 11. 即時性能統計計時器 (每秒更新一次 FPS 與 Bitrate)
+    // 12. 多人協同控制權接管 / 釋放按鈕事件
+    if (controlActionBtn) {
+        controlActionBtn.addEventListener('click', () => {
+            if (controlState.controller_id === myInfo.id) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'release_control' }));
+                }
+            } else {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: 'take_control' }));
+                }
+            }
+        });
+    }
+
+    // 在線成員面板開關
+    if (membersBtn) {
+        membersBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (membersModal) membersModal.classList.toggle('hidden');
+        });
+    }
+    if (closeMembersBtn) {
+        closeMembersBtn.addEventListener('click', () => {
+            if (membersModal) membersModal.classList.add('hidden');
+        });
+    }
+    // 點擊空白處關閉成員面板
+    document.addEventListener('click', (e) => {
+        if (membersModal && !membersModal.contains(e.target) && e.target !== membersBtn && !membersBtn.contains(e.target)) {
+            membersModal.classList.add('hidden');
+        }
+    });
+
+    // 儲存修改暱稱
+    if (saveNicknameBtn && myNicknameInput) {
+        saveNicknameBtn.addEventListener('click', () => {
+            const newName = myNicknameInput.value.trim();
+            if (newName && ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'rename', name: newName }));
+                showToast(`✅ 暱稱已更新為：${newName}`);
+            }
+        });
+        myNicknameInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') saveNicknameBtn.click();
+        });
+    }
+
+    // 11. 連線健康監控與即時性能統計計時器 (每 200ms 偵測連線訊號，每秒統計一次 FPS/Bitrate)
     setInterval(() => {
         const now = performance.now();
+
+        // 1. 連線健康度秒級敏銳監測 (僅在 WebSocket 處於連線狀態時)
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            const idleSec = (now - lastDataReceivedTime) / 1000.0;
+
+            if (idleSec >= 3.0) {
+                // 超過 3 秒完全未收到任何影像訊框或心跳：判定為死連線，主動斬斷並急速重連！
+                console.warn(`[連線逾時判定] 已有 ${idleSec.toFixed(1)} 秒未收到任何訊框或數據，主動中斷急速重連！`);
+                try {
+                    ws.onclose = null;
+                    ws.onerror = null;
+                    ws.close();
+                } catch (e) {}
+                ws = null;
+                scheduleReconnect(true); // 立即重試重連
+                return;
+            } else if (idleSec >= 1.0) {
+                // 超過 1 秒未收到新數據或訊號不穩：即刻顯示訊號微弱提示
+                statusText.textContent = `⚠️ 訊號微弱 (收訊不良 ${idleSec.toFixed(1)}s)`;
+                statusDot.className = 'dot warning';
+            } else {
+                // 訊號良好且串流正常：恢復連線狀態
+                if (statusDot.className !== 'dot connected') {
+                    statusText.textContent = '已連線 (串流中)';
+                    statusDot.className = 'dot connected';
+                }
+            }
+        }
+
+        // 2. 每秒計算並更新一次 FPS 與 Bitrate
         const durationSec = (now - lastStatsTime) / 1000.0;
-        if (durationSec > 0) {
+        if (durationSec >= 1.0) {
             const currentFps = (frameCounter / durationSec).toFixed(1);
             const currentKbps = ((byteCounter * 8) / 1024.0 / durationSec).toFixed(0);
 
             statsFps.textContent = `${currentFps} FPS`;
             statsBitrate.textContent = `${currentKbps} Kbps`;
-        }
 
-        frameCounter = 0;
-        byteCounter = 0;
-        lastStatsTime = now;
-    }, 1000);
+            frameCounter = 0;
+            byteCounter = 0;
+            lastStatsTime = now;
+        }
+    }, 200);
 
     // 每次開啟頁面或重新整理（F5），一律強制重新驗證身分（Token 不持久化，僅留存於記憶體供 WebSocket 自動重連使用）
     try { localStorage.removeItem('webkvm_token'); } catch (e) {}
