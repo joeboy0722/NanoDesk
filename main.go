@@ -637,11 +637,11 @@ func main() {
 		}
 	}()
 
+	var port int
 	modeHTTPS := flag.Bool("https", false, "啟用記憶體自簽 HTTPS 模式 (預設為純 HTTP 模式)")
-	portFlag := flag.Int("port", 8080, "服務監聽埠號")
+	flag.IntVar(&port, "port", 8080, "服務監聽埠號 (支援 --port 或 -port)")
+	flag.IntVar(&port, "p", 8080, "服務監聽埠號簡寫 (支援 -p 或 --p)")
 	flag.Parse()
-
-	port := *portFlag
 	addr := fmt.Sprintf(":%d", port)
 
 	// 0. 外部依賴檢查：Windows Media Foundation (mfplat.dll / mfreadwrite.dll)
