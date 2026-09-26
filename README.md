@@ -21,7 +21,7 @@
   - 內建靜態 Web 前端資源，雙擊即跑。
 - 🖥️ **免裝客戶端 (Clientless)**：
   - 控制端只需現代瀏覽器（Chrome, Edge, Safari），開箱即用。
-  - 採用 **WebCodecs + H.264** 硬體解碼，延遲低至 30~50ms，支援 30~60 FPS 流暢串流。
+  - 採用 **WebCodecs + H.264** 硬體解碼，延遲低至 30-50ms，支援 30-60 FPS 流暢串流。
 - ⚡ **雙擷取引擎 (DXGI + GDI)**：
   - 預設採用 **DirectX 11 DXGI Desktop Duplication** GPU 顯存直取，CPU 佔用率極低 (< 3%)。
   - 支援多螢幕熱切換，自動感知並校正硬體螢幕旋轉（如副螢幕倒置 180°）。
