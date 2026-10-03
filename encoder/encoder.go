@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -27,83 +28,94 @@ func CheckMediaFoundationAvailable() error {
 	return nil
 }
 
-// H264Encoder Windows 原生低延遲 H.264 編碼器封裝
+// Each encoder owns one OS thread for its entire COM/MF lifetime.
 type H264Encoder struct {
-	mu        sync.Mutex
-	handle    unsafe.Pointer
-	width     int
-	height    int
-	outBuffer []byte
+	mu            sync.Mutex
+	width, height int
+	commands      chan *encoderCommand
+	closed        bool
+}
+type encoderCommand struct {
+	kind         int
+	pixels, data []byte
+	key          bool
+	err          error
+	done         chan struct{}
 }
 
-// NewH264Encoder 建立新的 H.264 編碼器
 func NewH264Encoder(width, height, fps, bitrateKbps int) (*H264Encoder, error) {
-	ptr := C.H264_CreateEncoder(
-		C.int(width),
-		C.int(height),
-		C.int(fps),
-		C.int(bitrateKbps),
-	)
-	if ptr == nil {
-		return nil, fmt.Errorf("建立 Windows 原生 H.264 編碼器失敗：系統未提供相容之 H.264 MFT 編碼轉換器。請確認 Windows Media Foundation 功能或顯示卡硬體加速運作正常。")
+	if width <= 0 || height <= 0 || width > 16384 || height > 16384 || int64(width)*int64(height) > 64*1024*1024 {
+		return nil, fmt.Errorf("invalid encoder dimensions")
 	}
+	e := &H264Encoder{width: width, height: height, commands: make(chan *encoderCommand)}
+	ready := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		handle := C.H264_CreateEncoder(C.int(width), C.int(height), C.int(fps), C.int(bitrateKbps))
+		if handle == nil {
+			ready <- fmt.Errorf("建立 Windows H.264 編碼器失敗")
+			return
+		}
 
-	maxOut := width * height // 輸出緩衝區上限
-	return &H264Encoder{
-		handle:    ptr,
-		width:     width,
-		height:    height,
-		outBuffer: make([]byte, maxOut),
-	}, nil
+		out := make([]byte, max(width*height, 1024*1024))
+		ready <- nil
+		for cmd := range e.commands {
+			switch cmd.kind {
+			case 0:
+				var key C.int
+				n := int(C.H264_EncodeFrame(handle, (*C.uchar)(unsafe.Pointer(&cmd.pixels[0])), (*C.uchar)(unsafe.Pointer(&out[0])), C.int(len(out)), &key))
+				if n < 0 || n > len(out) {
+					cmd.err = fmt.Errorf("H.264 編碼錯誤: %d", n)
+				} else {
+					cmd.data = append([]byte(nil), out[:n]...)
+					cmd.key = key != 0
+				}
+			case 1:
+				C.H264_ForceKeyframe(handle)
+			case 2:
+				C.H264_DestroyEncoder(handle)
+				close(cmd.done)
+				return
+			}
+			close(cmd.done)
+		}
+	}()
+	if err := <-ready; err != nil {
+		return nil, err
+	}
+	return e, nil
 }
 
-// Encode 將 32-bit BGRA 像素幀編碼為 H.264 Annex-B NALU 數據包
-// 回傳: (壓縮數據 []byte, 是否為關鍵幀 bool, 錯誤 error)
-func (e *H264Encoder) Encode(bgraPixels []byte) ([]byte, bool, error) {
+func (e *H264Encoder) Encode(pixels []byte) ([]byte, bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	if e.handle == nil {
-		return nil, false, fmt.Errorf("編碼器已被銷毀")
+	if e.closed || len(pixels) < e.width*e.height*4 {
+		return nil, false, fmt.Errorf("編碼器已關閉或畫面大小不符")
 	}
-
-	var isKey C.int
-	outLen := C.H264_EncodeFrame(
-		e.handle,
-		(*C.uchar)(unsafe.Pointer(&bgraPixels[0])),
-		(*C.uchar)(unsafe.Pointer(&e.outBuffer[0])),
-		C.int(len(e.outBuffer)),
-		&isKey,
-	)
-
-	if outLen < 0 {
-		return nil, false, fmt.Errorf("H.264 編碼錯誤 (代碼: %d)", int(outLen))
-	}
-	if outLen == 0 {
-		return nil, false, nil // 尚無輸出幀 (B 幀或佇列緩衝中)
-	}
-
-	res := make([]byte, int(outLen))
-	copy(res, e.outBuffer[:int(outLen)])
-	return res, isKey != 0, nil
+	cmd := &encoderCommand{pixels: pixels, done: make(chan struct{})}
+	e.commands <- cmd
+	<-cmd.done
+	return cmd.data, cmd.key, cmd.err
 }
-
-// RequestKeyframe 強制編碼器在下一幀輸出 IDR 關鍵幀
 func (e *H264Encoder) RequestKeyframe() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.handle != nil {
-		C.H264_ForceKeyframe(e.handle)
+	if e.closed {
+		return
 	}
+	cmd := &encoderCommand{kind: 1, done: make(chan struct{})}
+	e.commands <- cmd
+	<-cmd.done
 }
-
-// Close 釋放編碼器
 func (e *H264Encoder) Close() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	if e.handle != nil {
-		C.H264_DestroyEncoder(e.handle)
-		e.handle = nil
+	if e.closed {
+		return
 	}
+	e.closed = true
+	cmd := &encoderCommand{kind: 2, done: make(chan struct{})}
+	e.commands <- cmd
+	<-cmd.done
 }

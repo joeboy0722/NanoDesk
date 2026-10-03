@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>NanoDesk - 輕量極速 Web 遠端桌面</title>
-    <link rel="icon" type="image/x-icon" href="favicon.ico">
+    <link rel="icon" type="image/png" href="logo.png">
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -37,7 +37,6 @@
                 <button class="btn btn-shortcut" data-key="win_d" title="顯示或隱藏桌面">Win+D</button>
                 <!-- 特權管理員組合鍵 (僅限完全控制角色) -->
                 <button class="btn btn-shortcut btn-admin" data-key="ctrl_shift_esc" title="開啟工作管理員">工作管理員</button>
-                <button class="btn btn-shortcut btn-danger btn-admin" data-key="ctrl_alt_del" title="發送安全組合鍵">Ctrl+Alt+Del</button>
             </div>
             <span class="divider"></span>
             <!-- 多人協同控制狀態與在線成員 -->
@@ -49,6 +48,9 @@
         </div>
 
         <div class="right-group">
+ <span id="transportBadge" class="stat-badge"></span>
+ <label title="僅與目前主控者自動同步剪貼簿"><input id="clipboardAuto" type="checkbox" checked>剪貼簿</label>
+ <select id="zoomSelect" aria-label="畫面縮放"><option value="fit">適應視窗</option><option value="1">原始比例</option><option value="1.25">125%</option><option value="1.5">150%</option><option value="2">200%</option></select>
             <!-- 即時性能統計與解碼引擎資訊 -->
             <span id="engineBadge" class="stat-badge" title="目前視訊解碼引擎">⚡ 硬解</span>
             <span id="statsFps" class="stat-badge">0 FPS</span>
@@ -100,7 +102,8 @@
             <div class="upload-card">
                 <div class="upload-header">
                     <span class="upload-icon">📤</span>
-                    <span id="uploadFileName" class="upload-filename">正在傳送檔案...</span>
+                    <button id="cancelUploadBtn" class="btn">取消</button>
+ <span id="uploadFileName" class="upload-filename">正在傳送檔案...</span>
                 </div>
                 <div class="progress-bar-bg">
                     <div id="uploadProgressBar" class="progress-bar-fill" style="width: 0%;"></div>
@@ -119,12 +122,13 @@
                     <img src="logo.png" class="auth-logo-img" alt="NanoDesk">
                 </div>
                 <h2>NanoDesk 遠端連線授權</h2>
-                <p class="auth-desc">請輸入 6 位數存取密碼，或向被控端主人發送審核請求。</p>
+                <p id="transportNotice" class="auth-desc"></p>
+ <p class="auth-desc">請輸入存取密碼 (支援英文、數字與特殊符號)，或向被控端主人發送審核請求。</p>
 
                 <!-- 方式一：密碼直接登入 -->
                 <div id="authPwdSection" class="auth-section">
                     <div class="input-row">
-                        <input type="password" id="authPasswordInput" placeholder="請輸入存取密碼" maxlength="20" autofocus>
+                        <input type="password" id="authPasswordInput" placeholder="請輸入存取密碼 (支援英數及符號)" maxlength="64" autofocus>
                         <button id="authLoginBtn" class="btn btn-primary">連線</button>
                     </div>
                     <div id="authErrorMsg" class="auth-error hidden"></div>

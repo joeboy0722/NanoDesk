@@ -3,14 +3,16 @@ package input
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
 var (
 	modUser32            = syscall.NewLazyDLL("user32.dll")
-	procSendInput         = modUser32.NewProc("SendInput")
-	procGetSystemMetrics  = modUser32.NewProc("GetSystemMetrics")
+	procSendInput        = modUser32.NewProc("SendInput")
+	procGetSystemMetrics = modUser32.NewProc("GetSystemMetrics")
 )
 
 const (
@@ -71,22 +73,35 @@ type INPUT struct {
 
 // InputController 提供跨螢幕絕對座標映射與 Win32 輸入注入
 type InputController struct {
-	mu           sync.Mutex
-	vLeft        int
-	vTop         int
-	vWidth       int
-	vHeight      int
-	pressedKeys  map[uint16]bool
+	mu             sync.Mutex
+	vLeft          int
+	vTop           int
+	vWidth         int
+	vHeight        int
+	pressedKeys    map[uint16]bool
+	pressedButtons map[int]bool
 }
 
 // NewInputController 建立輸入控制器
 func NewInputController() *InputController {
 	c := &InputController{
-		pressedKeys: make(map[uint16]bool),
+		pressedKeys: make(map[uint16]bool), pressedButtons: make(map[int]bool),
 	}
 	c.UpdateVirtualDesktopMetrics()
 	// 啟動被控端實體硬體鍵鼠動作監控 (實體優先搶佔)
 	globalOverride.StartMonitoring()
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		var last int64
+		for range ticker.C {
+			now := atomic.LoadInt64(&globalOverride.lastPhysicalNano)
+			if now != last {
+				last = now
+				c.ReleaseAllKeys()
+			}
+		}
+	}()
 	return c
 }
 
@@ -143,8 +158,10 @@ func (c *InputController) MoveMouseAbsolute(monX, monY, monW, monH int, normX, n
 	defer c.mu.Unlock()
 
 	// 1. 計算該螢幕上的像素實體座標
-	targetPixelX := float64(monX) + (normX * float64(monW))
-	targetPixelY := float64(monY) + (normY * float64(monH))
+	normX = max(0, min(1, normX))
+	normY = max(0, min(1, normY))
+	targetPixelX := float64(monX) + (normX * float64(monW-1))
+	targetPixelY := float64(monY) + (normY * float64(monH-1))
 
 	// 2. 映射至 Windows 虛擬桌面標準絕對空間 (0 ~ 65535)
 	// 公式: (Pixel - VirtualLeft) * 65536 / VirtualWidth
@@ -162,15 +179,14 @@ func (c *InputController) MoveMouseAbsolute(monX, monY, monW, monH int, normX, n
 	mi.Dy = normY65535
 	mi.DwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
 
-	n := uint32(1)
-	cbSize := int32(unsafe.Sizeof(input))
-	procSendInput.Call(uintptr(n), uintptr(unsafe.Pointer(&input)), uintptr(cbSize))
-	return nil
+	return c.sendInputs([]INPUT{input})
 }
 
 // MouseButton 觸發滑鼠按鍵 (button: 0=左鍵, 1=中鍵, 2=右鍵)
 func (c *InputController) MouseButton(button int, isDown bool) error {
-	if globalOverride.IsOverridden() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if isDown && globalOverride.IsOverridden() {
 		return nil
 	}
 
@@ -203,9 +219,14 @@ func (c *InputController) MouseButton(button int, isDown bool) error {
 	mi := (*MOUSEINPUT)(unsafe.Pointer(&input.Ki[0]))
 	mi.DwFlags = flag
 
-	n := uint32(1)
-	cbSize := int32(unsafe.Sizeof(input))
-	procSendInput.Call(uintptr(n), uintptr(unsafe.Pointer(&input)), uintptr(cbSize))
+	if err := c.sendInputs([]INPUT{input}); err != nil {
+		return err
+	}
+	if isDown {
+		c.pressedButtons[button] = true
+	} else {
+		delete(c.pressedButtons, button)
+	}
 	return nil
 }
 
@@ -243,7 +264,7 @@ func (c *InputController) MouseWheel(deltaX, deltaY int) error {
 
 // SendKey 注入鍵盤虛擬鍵 (VK Code)
 func (c *InputController) SendKey(vk uint16, isDown bool) error {
-	if globalOverride.IsOverridden() {
+	if isDown && globalOverride.IsOverridden() {
 		return nil
 	}
 
@@ -261,17 +282,18 @@ func (c *InputController) SendKey(vk uint16, isDown bool) error {
 		flags |= KEYEVENTF_EXTENDEDKEY
 	}
 
+	if !isDown {
+		flags |= KEYEVENTF_KEYUP
+	}
+	ki.DwFlags = flags
+	if err := c.sendInputs([]INPUT{input}); err != nil {
+		return err
+	}
 	if isDown {
 		c.pressedKeys[vk] = true
 	} else {
-		flags |= KEYEVENTF_KEYUP
 		delete(c.pressedKeys, vk)
 	}
-	ki.DwFlags = flags
-
-	n := uint32(1)
-	cbSize := int32(unsafe.Sizeof(input))
-	procSendInput.Call(uintptr(n), uintptr(unsafe.Pointer(&input)), uintptr(cbSize))
 	return nil
 }
 
@@ -315,7 +337,7 @@ func (c *InputController) ReleaseAllKeys() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if len(c.pressedKeys) == 0 {
+	if len(c.pressedKeys) == 0 && len(c.pressedButtons) == 0 {
 		return
 	}
 
@@ -333,6 +355,21 @@ func (c *InputController) ReleaseAllKeys() {
 		inputs = append(inputs, input)
 	}
 
+	for button := range c.pressedButtons {
+		var event INPUT
+		event.Type = INPUT_MOUSE
+		mi := (*MOUSEINPUT)(unsafe.Pointer(&event.Ki[0]))
+		switch button {
+		case 0:
+			mi.DwFlags = MOUSEEVENTF_LEFTUP
+		case 1:
+			mi.DwFlags = MOUSEEVENTF_MIDDLEUP
+		case 2:
+			mi.DwFlags = MOUSEEVENTF_RIGHTUP
+		}
+		inputs = append(inputs, event)
+	}
+	c.pressedButtons = make(map[int]bool)
 	c.pressedKeys = make(map[uint16]bool)
 	if len(inputs) > 0 {
 		n := uint32(len(inputs))
@@ -363,4 +400,25 @@ func isExtendedKey(vk uint16) bool {
 	default:
 		return false
 	}
+}
+
+// Check every ordering of the restricted combinations, including modifier-last input.
+func (c *InputController) BlockedStandardKey(vk uint16, down bool) bool {
+	if !down {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	pressed := func(keys ...uint16) bool {
+		for _, k := range keys {
+			if k == vk || c.pressedKeys[k] {
+				return true
+			}
+		}
+		return false
+	}
+	ctrl := pressed(0x11, 0xa2, 0xa3)
+	shift := pressed(0x10, 0xa0, 0xa1)
+	alt := pressed(0x12, 0xa4, 0xa5)
+	return (ctrl && shift && pressed(0x1b)) || (ctrl && alt && pressed(0x2e))
 }

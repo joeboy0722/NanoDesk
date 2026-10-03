@@ -48,7 +48,7 @@
     const engineBadge = document.getElementById('engineBadge');
 
     // 檢查瀏覽器解碼能力：優先採用 WebCodecs 硬解；非安全環境 (純 HTTP) 則切換至 MSE (jmuxer)
-    const isWebCodecsSupported = ('VideoDecoder' in window);
+    let isWebCodecsSupported = ('VideoDecoder' in window);
     const isMseSupported = ('MediaSource' in window) && (typeof JMuxer !== 'undefined');
 
     if (!isWebCodecsSupported && !isMseSupported) {
@@ -89,6 +89,71 @@
     let lastSyncedText = '';
     let lastImageKey = ''; // 記錄本機最新同步圖片的特徵 (大小+類型)，防止重覆上傳
     let reconnectTimer = null;
+ let reconnectAttempts = 0;
+ let authenticatedSocket = false;
+ let decoderCodec = '';
+ let lastDecoderRecovery = 0;
+ let lastVideoReceivedTime = performance.now();
+ let lastFrameRenderedTime = performance.now();
+ let remoteWidth = 0, remoteHeight = 0;
+ let activeUpload = null;
+ const clipboardAuto = document.getElementById('clipboardAuto');
+ const zoomSelect = document.getElementById('zoomSelect');
+ const encrypted = window.location.protocol === 'https:';
+ document.getElementById('transportBadge').textContent = encrypted ? 'HTTPS 加密' : 'HTTP 未加密';
+ document.getElementById('transportNotice').textContent = encrypted ? 'HTTPS 加密連線；請確認主機與憑證來源。' : 'HTTP 未加密：密碼、畫面及檔案會明文傳輸，請在受信任區網或 VPN 使用。';
+ clipboardAuto.addEventListener('change', () => { sendControl({type:'clipboard_auto',enabled:clipboardAuto.checked}); if (canAutoClipboard()) { syncClipboardText(); checkAndSyncLocalClipboardImage(); } });
+ zoomSelect.addEventListener('change',applyZoom);
+ window.addEventListener('resize',applyZoom);
+ document.getElementById('cancelUploadBtn').addEventListener('click',()=>{ if(activeUpload) activeUpload.abort(); });
+ if (video && video.requestVideoFrameCallback) {
+  const presented = () => { lastFrameRenderedTime=performance.now(); if (!isWebCodecsSupported) frameCounter++; video.requestVideoFrameCallback(presented); };
+  video.requestVideoFrameCallback(presented);
+ } else if(video) { video.addEventListener('timeupdate',()=>{lastFrameRenderedTime=performance.now();}); }
+
+ function canAutoClipboard() { return currentRole>=2 && clipboardAuto.checked && authenticatedSocket && controlState.controller_id===myInfo.id && !controlState.is_free && !controlState.local_active; }
+ function applyZoom() {
+  const el=activeDisplayElement;
+  const width=remoteWidth || canvas.width, height=remoteHeight || canvas.height;
+  if(!width || !height) return;
+  const viewport=document.getElementById('viewport');
+  const fit=zoomSelect.value==='fit';
+  const scale=fit ? Math.min(viewport.clientWidth/width,viewport.clientHeight/height) : Number(zoomSelect.value);
+  el.style.width=`${width*scale}px`; el.style.height=`${height*scale}px`;
+  el.style.maxWidth='none'; el.style.maxHeight='none';
+  viewport.style.justifyContent=fit?'center':'flex-start'; viewport.style.alignItems=fit?'center':'flex-start'; viewport.style.overflow=fit?'hidden':'auto';
+ }
+ function loseAuthorization() {
+  currentToken=''; currentRole=0; authenticatedSocket=false;shortcutGroup.style.display='none';monitorSelect.disabled=true;clipboardAuto.disabled=true;controlActionBtn.classList.add('hidden');
+  if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+  if(ws){ws.onclose=null;ws.close();ws=null;}
+  if(activeUpload)activeUpload.abort();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(decoder && decoder.state!=='closed')decoder.close();
+  if(jmuxer){jmuxer.destroy();jmuxer=null;}
+  controlState={is_free:true,controller_id:'',local_active:false};
+  showAuthOverlay();statusText.textContent='請重新授權';statusDot.className='dot disconnected';
+ }
+ function recoverVideo() {
+  if(performance.now()-lastDecoderRecovery<500)return;
+  lastDecoderRecovery=performance.now();initDecoder();requestKeyframe();
+ }
+ function useMse() {
+  if(!isMseSupported){unsupportedOverlay.classList.remove('hidden');return;}
+  if(decoder && decoder.state!=='closed')decoder.close();
+  isWebCodecsSupported=false;canvas.style.display='none';video.style.display='block';activeDisplayElement=video;
+  engineBadge.textContent='相容 (MSE)';initDecoder();applyZoom();requestKeyframe();
+ }
+ function codecFromAnnexB(bytes) {
+  for(let i=0;i+6<bytes.length;i++) {
+   let start=-1;
+   if(bytes[i]===0 && bytes[i+1]===0 && bytes[i+2]===1)start=i+3;
+   else if(bytes[i]===0 && bytes[i+1]===0 && bytes[i+2]===0 && bytes[i+3]===1)start=i+4;
+   if(start>=0 && (bytes[start]&31)===7 && start+3<bytes.length) return 'avc1.'+[bytes[start+1],bytes[start+2],bytes[start+3]].map(v=>v.toString(16).padStart(2,'0')).join('');
+  }
+  return decoderCodec || 'avc1.42E028';
+ }
+
     let authPollingTimer = null;
     let lastDataReceivedTime = performance.now(); // 記錄最後收到影像訊框或心跳控制訊息的時間戳記
 
@@ -103,7 +168,8 @@
         currentRole = role;
         roleBadge.className = 'role-badge';
 
-        if (role === 1) {
+        monitorSelect.disabled=role<2;clipboardAuto.disabled=role<2;
+ if (role === 1) {
             // 第一級：僅觀看模式
             roleBadge.textContent = '👁️ 僅觀看模式';
             roleBadge.classList.add('role-view');
@@ -151,8 +217,8 @@
 
     // 1. 密碼直接登入處理
     function submitPasswordAuth() {
-        const pwd = authPasswordInput.value.trim();
-        if (!pwd) {
+        const pwd = authPasswordInput.value;
+        if (!pwd || pwd.trim() === '') {
             authErrorMsg.textContent = '請輸入存取密碼！';
             authErrorMsg.classList.remove('hidden');
             return;
@@ -202,7 +268,7 @@
         authErrorMsg.classList.add('hidden');
 
         fetch('/api/auth/request', { method: 'POST' })
-        .then(res => res.json())
+        .then(res => res.json().then(data=>{if(!res.ok)throw new Error(data.error || "請求失敗");return data;}))
         .then(data => {
             const reqId = data.request_id;
             // 啟動 1.5 秒定時輪詢核准狀態
@@ -246,7 +312,7 @@
 
     // 1. 初始化視訊解碼器 (自適應 WebCodecs 硬解 / MSE 串流)
     function initDecoder() {
-        hasReceivedKeyframe = false;
+        hasReceivedKeyframe = false;decoderCodec='';
 
         if (isWebCodecsSupported) {
             if (decoder && decoder.state !== 'closed') {
@@ -257,14 +323,10 @@
                 output: handleDecodedFrame,
                 error: (err) => {
                     console.error('[WebCodecs 解碼錯誤]', err);
-                    requestKeyframe();
+                    recoverVideo();
                 }
             });
 
-            decoder.configure({
-                codec: 'avc1.42E01F',
-                optimizeForLatency: true
-            });
             console.log('[WebCodecs] 原生 H.264 解碼器已就緒');
         } else if (isMseSupported) {
             if (jmuxer) {
@@ -277,7 +339,8 @@
                 flushingTime: 0,
                 clearBuffer: true,
                 fps: 30,
-                debug: false
+                debug: false,
+ onError:recoverVideo
             });
             console.log('[MSE] jMuxer H.264 解碼器已就緒 (相容純 HTTP)');
         }
@@ -285,25 +348,23 @@
 
     // 2. 處理解碼完成的視訊訊框並渲染至 Canvas
     function handleDecodedFrame(videoFrame) {
-        if (canvas.width !== videoFrame.displayWidth || canvas.height !== videoFrame.displayHeight) {
-            canvas.width = videoFrame.displayWidth;
-            canvas.height = videoFrame.displayHeight;
-        }
+        if(canvas.width!==(remoteWidth||videoFrame.displayWidth) || canvas.height!==(remoteHeight||videoFrame.displayHeight)){canvas.width=remoteWidth||videoFrame.displayWidth;canvas.height=remoteHeight||videoFrame.displayHeight;applyZoom();}
 
-        ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
-        videoFrame.close();
+        try { ctx.drawImage(videoFrame,0,0,canvas.width,canvas.height,0,0,canvas.width,canvas.height); }
+        finally { videoFrame.close(); }
+ lastFrameRenderedTime=performance.now();
         frameCounter++;
     }
 
     // 排程自動重新連線 (可指定 immediate 為 true 進行 150ms 急速重試)
     function scheduleReconnect(immediate = false) {
-        if (reconnectTimer) return;
+        if (reconnectTimer || !currentToken || !navigator.onLine) return;
         statusText.textContent = '連線中斷，正在自動重連...';
         statusDot.className = 'dot disconnected';
         reconnectTimer = setTimeout(() => {
             reconnectTimer = null;
             connectWebSocket();
-        }, immediate ? 150 : 1500);
+        }, Math.min(10000,(immediate?150:1500)*Math.pow(2,Math.min(reconnectAttempts++,3)))*(0.9+Math.random()*0.2));
     }
 
     // 3. 連接 WebSocket 伺服器
@@ -321,9 +382,7 @@
 
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         let wsUrl = `${protocol}//${window.location.host}/ws`;
-        if (currentToken) {
-            wsUrl += `?token=${encodeURIComponent(currentToken)}`;
-        }
+
 
         statusText.textContent = '連線中...';
         statusDot.className = 'dot disconnected';
@@ -332,16 +391,19 @@
         ws.binaryType = 'arraybuffer';
 
         ws.onopen = () => {
+ authenticatedSocket=false;sendControl({type:'auth_token',token:currentToken});
             lastDataReceivedTime = performance.now();
-            statusText.textContent = '已連線 (串流中)';
+            statusText.textContent = '驗證連線中...';
             statusDot.className = 'dot connected';
             initDecoder();
             requestKeyframe();
         };
 
-        ws.onclose = () => {
-            scheduleReconnect();
-        };
+        ws.onclose = (event) => {
+ authenticatedSocket=false;
+ if(event.code===1008){loseAuthorization();showToast("連線授權已失效，請重新登入");return;}
+ scheduleReconnect();
+ };
 
         ws.onerror = (err) => {
             console.warn('[WebSocket 異常]', err);
@@ -371,7 +433,8 @@
     // 4. 處理二進位視訊數據封包
     function handleBinaryVideoData(arrayBuffer) {
         lastDataReceivedTime = performance.now();
-        const bytes = new Uint8Array(arrayBuffer);
+        lastVideoReceivedTime=performance.now();
+ const bytes = new Uint8Array(arrayBuffer);
         if (bytes.length < 5) return; // 協議最小長度：1(標誌) + 4(時間戳)
 
         byteCounter += bytes.length;
@@ -391,6 +454,11 @@
 
         if (isWebCodecsSupported) {
             try {
+                if(decoder.decodeQueueSize>6){recoverVideo();return;}
+                if(isKey){
+                 const codec=codecFromAnnexB(naluData);
+                 if(decoder.state!=='configured' || codec!==decoderCodec){decoder.configure({codec,optimizeForLatency:true});decoderCodec=codec;}
+                }
                 const chunk = new EncodedVideoChunk({
                     type: isKey ? 'key' : 'delta',
                     timestamp: timestampMs * 1000,
@@ -401,16 +469,15 @@
                     decoder.decode(chunk);
                 }
             } catch (e) {
-                console.warn('[WebCodecs 訊框解碼略過]', e);
+                console.warn('[WebCodecs 訊框解碼略過]', e);useMse();
             }
         } else if (jmuxer) {
             try {
                 jmuxer.feed({
                     video: naluData
                 });
-                frameCounter++;
             } catch (e) {
-                console.warn('[MSE 訊框解碼略過]', e);
+                console.warn('[MSE 訊框解碼略過]', e);recoverVideo();
             }
         }
     }
@@ -418,13 +485,14 @@
     // 5. 處理後端控制訊息
     function handleControlMessage(msg) {
         if (msg.type === 'auth_success') {
+ authenticatedSocket=true;reconnectAttempts=0;
+ if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
+ sendControl({type:'clipboard_auto',enabled:clipboardAuto.checked});
             // 身分驗證通過
             applyRolePermissions(msg.role, msg.role_name);
         } else if (msg.type === 'auth_fail') {
             // Token 失效或被踢除
-            currentToken = '';
-            currentRole = 0;
-            showAuthOverlay();
+            loseAuthorization();
             showToast('⚠️ 連線憑證已失效，請重新授權');
         } else if (msg.type === 'init') {
             // 初始化螢幕選單清單
@@ -438,7 +506,11 @@
                 monitorSelect.appendChild(opt);
             });
             monitorSelect.value = msg.current;
+ const monitor=msg.monitors.find(m=>m.index===msg.current);
+ if(monitor){remoteWidth=monitor.width;remoteHeight=monitor.height;}
+ initDecoder();applyZoom();requestKeyframe();
         } else if (msg.type === 'clipboard_sync' || msg.type === 'clipboard_data') {
+ if(!canAutoClipboard())return;
             lastSyncedText = msg.text || '';
             if (lastSyncedText) {
                 if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -456,6 +528,7 @@
                 }
             }
         } else if (msg.type === 'clipboard_image_sync') {
+ if(!canAutoClipboard())return;
             try {
                 const byteChars = atob(msg.data);
                 const byteNumbers = new Array(byteChars.length);
@@ -482,8 +555,10 @@
             if (myColorDot) myColorDot.style.backgroundColor = myInfo.color;
             if (myNicknameInput && !myNicknameInput.value) myNicknameInput.value = myInfo.name;
         } else if (msg.type === 'control_state') {
-            controlState = msg;
-            updateControlUI();
+            const wasController=canAutoClipboard();
+ controlState = msg;
+ updateControlUI();
+ if(!wasController && canAutoClipboard()){syncClipboardText();checkAndSyncLocalClipboardImage();}
         } else if (msg.type === 'members_update') {
             members = msg.members || [];
             if (onlineCount) onlineCount.textContent = msg.count || members.length;
@@ -491,7 +566,7 @@
             renderMembersList();
         } else if (msg.type === 'laser_pointer') {
             renderLaserPointer(msg);
-        } else if (msg.type === 'control_denied') {
+        } else if (msg.type === 'control_denied' || msg.type === 'operation_error') {
             showToast(`⚠️ ${msg.message}`);
         }
     }
@@ -499,10 +574,12 @@
     // 更新頂部多人控制權狀態 UI
     function updateControlUI() {
         if (!controlStatusBadge || !controlActionBtn) return;
+        if(controlState.local_active){controlStatusBadge.textContent='本機操作中';controlStatusBadge.className='control-badge busy';controlActionBtn.classList.add('hidden');return;}
+ if(currentRole<2){controlActionBtn.classList.add('hidden');controlStatusBadge.textContent='僅觀看';return;}
         if (controlState.is_free) {
             controlStatusBadge.className = 'control-badge free';
             controlStatusBadge.textContent = '🟢 自由控制';
-            controlActionBtn.classList.add('hidden');
+            controlActionBtn.textContent='取得控制';controlActionBtn.classList.remove('hidden');
         } else if (controlState.controller_id === myInfo.id) {
             controlStatusBadge.className = 'control-badge me';
             controlStatusBadge.textContent = '🎮 我正在控制中';
@@ -527,14 +604,13 @@
             const ctrlBadge = m.is_controller ? '<span class="member-badge-ctrl" title="正在控制中">🎮</span>' : '';
             const roleClass = m.role === 3 ? 'admin' : (m.role === 2 ? 'std' : 'view');
 
-            li.innerHTML = `
-                <div class="member-left">
-                    <span class="member-color-dot" style="background-color: ${m.color || '#3b82f6'}"></span>
-                    <span class="member-name" title="${m.name}">${m.name}${isMe}</span>
-                    ${ctrlBadge}
-                </div>
-                <span class="member-role ${roleClass}">${m.role_name}</span>
-            `;
+            const left=document.createElement('div');left.className='member-left';
+            const dot=document.createElement('span');dot.className='member-color-dot';dot.style.backgroundColor=m.color;
+            const name=document.createElement('span');name.className='member-name';name.title=m.name;name.textContent=m.name+isMe;
+            left.append(dot,name);
+            if(m.is_controller){const badge=document.createElement('span');badge.textContent='🎮';left.appendChild(badge);}
+            const role=document.createElement('span');role.className='member-role '+roleClass;role.textContent=m.role_name;
+            li.append(left,role);
             membersList.appendChild(li);
         });
     }
@@ -546,14 +622,9 @@
         if (!p) {
             const el = document.createElement('div');
             el.className = 'laser-pointer';
-            el.innerHTML = `
-                <div class="laser-cursor">
-                    <svg viewBox="0 0 24 24" fill="${msg.color || '#3b82f6'}">
-                        <path d="M4 2L20 10L12 12L10 20L4 2Z" stroke="#ffffff" stroke-width="1.5" stroke-linejoin="round"/>
-                    </svg>
-                </div>
-                <div class="laser-tag" style="background-color: ${msg.color || '#3b82f6'}">${msg.name || '協同成員'}</div>
-            `;
+            const cursor=document.createElement('div');cursor.className='laser-cursor';cursor.textContent='➤';cursor.style.color=msg.color;
+            const tag=document.createElement('div');tag.className='laser-tag';tag.style.backgroundColor=msg.color;tag.textContent=msg.name || '協同成員';
+            el.append(cursor,tag);
             laserContainer.appendChild(el);
             p = { element: el, timer: null };
             laserPointers[msg.id] = p;
@@ -674,7 +745,7 @@
     // 8. 鍵盤事件監聽 (僅在角色具備 RoleStandard 以上時允許操作)
     window.addEventListener('keydown', (e) => {
         if (currentRole < 2) return;
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+        if (!displayElements.includes(document.activeElement) || e.target.isContentEditable || ['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
 
         if (['Tab', 'Backspace', 'ContextMenu', 'AltLeft', 'AltRight'].includes(e.code) || e.code.startsWith('F')) {
             e.preventDefault();
@@ -696,7 +767,7 @@
 
     window.addEventListener('keyup', (e) => {
         if (currentRole < 2) return;
-        if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+        if (!displayElements.includes(document.activeElement) || e.target.isContentEditable || ['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
 
         if ((e.ctrlKey || e.metaKey) && e.code === 'KeyV') {
             return;
@@ -711,7 +782,7 @@
 
     // 檢查並同步本機剪貼簿圖片至遠端主機
     async function checkAndSyncLocalClipboardImage() {
-        if (currentRole < 2) return;
+        if (!canAutoClipboard()) return;
         if (!navigator.clipboard || !navigator.clipboard.read) return;
         try {
             const items = await navigator.clipboard.read();
@@ -719,11 +790,12 @@
                 const imageType = item.types.find(t => t.startsWith('image/'));
                 if (imageType) {
                     const blob = await item.getType(imageType);
-                    const imageKey = `${blob.size}_${blob.type}`;
+                    const imageKey = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',await blob.arrayBuffer()))).join(',');
                     if (imageKey !== lastImageKey) {
                         lastImageKey = imageKey;
                         const reader = new FileReader();
                         reader.onload = () => {
+ if(!canAutoClipboard())return;
                             const base64 = reader.result.split(',')[1];
                             sendControl({
                                 type: 'clipboard_image_upload',
@@ -741,9 +813,10 @@
 
     // 檢查並同步純文字剪貼簿
     function syncClipboardText() {
-        if (currentRole < 2) return;
+        if (!canAutoClipboard()) return;
         if (navigator.clipboard && navigator.clipboard.readText) {
             navigator.clipboard.readText().then(text => {
+ if(!canAutoClipboard())return;
                 if (text && text !== lastSyncedText) {
                     lastSyncedText = text;
                     sendControl({ type: 'clipboard_sync', text: text });
@@ -757,7 +830,11 @@
         checkAndSyncLocalClipboardImage();
     });
 
-    window.addEventListener('blur', () => {
+    document.addEventListener('visibilitychange',()=>{if(document.hidden)sendControl({type:'release_all_keys'});});
+ window.addEventListener('online',()=>scheduleReconnect(true));
+ window.addEventListener('offline',()=>{if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}statusText.textContent='網路離線';});
+ window.addEventListener('mouseup',e=>{if(currentRole>=2)sendControl({type:'mouse_button',button:e.button,isDown:false});});
+ window.addEventListener('blur', () => {
         if (currentRole >= 2) {
             sendControl({ type: 'release_all_keys' });
         }
@@ -807,7 +884,7 @@
                                 type: 'clipboard_image_paste',
                                 data: base64
                             });
-                            showToast('🖼️ 截圖已傳送至遠端並貼上');
+                            showToast('🖼️ 截圖貼上請求已送出');
                         };
                         reader.readAsDataURL(blob);
                         break;
@@ -825,7 +902,7 @@
                     type: 'clipboard_paste',
                     text: text
                 });
-                showToast('📋 已將剪貼簿文字傳送並貼上');
+                showToast('📋 文字貼上請求已送出');
             }
         }
     });
@@ -840,6 +917,8 @@
 
     function uploadFiles(files) {
         if (!files || files.length === 0) return;
+ if(activeUpload){showToast("已有檔案傳送中");return;}
+ if(files.length>100 || Array.from(files).reduce((sum,f)=>sum+f.size,0)>1024*1024*1024-1024*1024){showToast("單次最多 100 個檔案，含傳輸封裝需小於 1 GiB");return;}
         if (currentRole < 2) {
             showToast('🔒 僅觀看模式禁止傳送檔案');
             return;
@@ -860,7 +939,10 @@
         uploadProgressDetail.textContent = `0 MB / ${formatBytes(totalSize)} (計算速度中...)`;
         uploadModal.classList.remove('hidden');
 
-        const xhr = new XMLHttpRequest();
+        const xhr = new XMLHttpRequest();activeUpload=xhr;
+ xhr.onloadend=()=>{if(activeUpload===xhr)activeUpload=null;};
+ xhr.upload.onload=()=>{uploadProgressDetail.textContent="傳送完成，主機儲存中...";};
+ xhr.onabort=()=>{uploadProgressDetail.textContent="已取消；先前已完成的檔案會保留";uploadProgressBar.style.background="#f85149";};
         let lastLoaded = 0;
         let lastTime = performance.now();
 
@@ -883,7 +965,10 @@
         };
 
         xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
+            let result;try{result=JSON.parse(xhr.responseText);}catch(e){result={error:'主機回應格式錯誤'};}
+ const successes=(result.results||[]).filter(f=>f.path && !f.error);
+ const errors=(result.results||[]).filter(f=>f.error);
+ if (xhr.status >= 200 && xhr.status < 300 && result.status==='ok' && successes.length===files.length) {
                 uploadProgressBar.style.width = '100%';
                 uploadProgressBar.style.background = 'linear-gradient(90deg, #238636, #2ea043)';
                 uploadProgressPercent.textContent = '100%';
@@ -894,7 +979,7 @@
                 }, 2000);
             } else {
                 uploadProgressBar.style.background = '#f85149';
-                uploadProgressDetail.textContent = `❌ 傳輸失敗 (${xhr.status})`;
+                uploadProgressDetail.textContent = `已儲存 ${successes.length} 個；${errors.map(f=>`${f.name||"檔案"}：${f.error}`).join("；") || result.error || "傳輸失敗"}`;
                 showToast(`❌ 檔案傳送失敗: 權限不足或伺服器錯誤`);
                 setTimeout(() => {
                     uploadModal.classList.add('hidden');
@@ -911,7 +996,8 @@
             }, 3000);
         };
 
-        xhr.open('POST', `/upload?token=${encodeURIComponent(currentToken)}`, true);
+        xhr.open('POST', '/upload', true);
+ xhr.setRequestHeader('X-Auth-Token',currentToken);
         xhr.send(formData);
     }
 
@@ -1089,7 +1175,7 @@
         const now = performance.now();
 
         // 1. 連線健康度秒級敏銳監測 (僅在 WebSocket 處於連線狀態時)
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN && authenticatedSocket) {
             const idleSec = (now - lastDataReceivedTime) / 1000.0;
 
             if (idleSec >= 3.0) {
@@ -1100,6 +1186,7 @@
                     ws.onerror = null;
                     ws.close();
                 } catch (e) {}
+                authenticatedSocket=false;
                 ws = null;
                 scheduleReconnect(true); // 立即重試重連
                 return;
@@ -1109,7 +1196,10 @@
                 statusDot.className = 'dot warning';
             } else {
                 // 訊號良好且串流正常：恢復連線狀態
-                if (statusDot.className !== 'dot connected') {
+                if(now-lastVideoReceivedTime>3000 || now-lastFrameRenderedTime>3000){
+ statusText.textContent='連線正常，但畫面停滯，正在恢復...';statusDot.className='dot warning';
+ if(now-lastFrameRenderedTime>5000)recoverVideo();
+ } else {
                     statusText.textContent = '已連線 (串流中)';
                     statusDot.className = 'dot connected';
                 }
@@ -1136,4 +1226,5 @@
     currentToken = '';
     currentRole = 0;
     showAuthOverlay();
+ statusText.textContent="請登入";shortcutGroup.style.display="none";controlActionBtn.classList.add("hidden");monitorSelect.disabled=true;clipboardAuto.disabled=true;
 })();

@@ -27,16 +27,16 @@ var codeMap = map[string]uint16{
 	"F9": 0x78, "F10": 0x79, "F11": 0x7A, "F12": 0x7B,
 
 	// 控制鍵
-	"Enter":        0x0D, // VK_RETURN
-	"Escape":       0x1B, // VK_ESCAPE
-	"Backspace":    0x08, // VK_BACK
-	"Tab":          0x09, // VK_TAB
-	"Space":        0x20, // VK_SPACE
-	"CapsLock":     0x14, // VK_CAPITAL
-	"NumLock":      0x90, // VK_NUMLOCK
-	"ScrollLock":   0x91, // VK_SCROLL
-	"PrintScreen":  0x2C, // VK_SNAPSHOT
-	"Pause":        0x13, // VK_PAUSE
+	"Enter":       0x0D, // VK_RETURN
+	"Escape":      0x1B, // VK_ESCAPE
+	"Backspace":   0x08, // VK_BACK
+	"Tab":         0x09, // VK_TAB
+	"Space":       0x20, // VK_SPACE
+	"CapsLock":    0x14, // VK_CAPITAL
+	"NumLock":     0x90, // VK_NUMLOCK
+	"ScrollLock":  0x91, // VK_SCROLL
+	"PrintScreen": 0x2C, // VK_SNAPSHOT
+	"Pause":       0x13, // VK_PAUSE
 
 	// 修飾鍵
 	"ShiftLeft":    0xA0, // VK_LSHIFT
@@ -50,16 +50,16 @@ var codeMap = map[string]uint16{
 	"ContextMenu":  0x5D, // VK_APPS
 
 	// 導航與編輯鍵
-	"Insert":       0x2D, // VK_INSERT
-	"Delete":       0x2E, // VK_DELETE
-	"Home":         0x24, // VK_HOME
-	"End":          0x23, // VK_END
-	"PageUp":       0x21, // VK_PRIOR
-	"PageDown":     0x22, // VK_NEXT
-	"ArrowLeft":    0x25, // VK_LEFT
-	"ArrowUp":      0x26, // VK_UP
-	"ArrowRight":   0x27, // VK_RIGHT
-	"ArrowDown":    0x28, // VK_DOWN
+	"Insert":     0x2D, // VK_INSERT
+	"Delete":     0x2E, // VK_DELETE
+	"Home":       0x24, // VK_HOME
+	"End":        0x23, // VK_END
+	"PageUp":     0x21, // VK_PRIOR
+	"PageDown":   0x22, // VK_NEXT
+	"ArrowLeft":  0x25, // VK_LEFT
+	"ArrowUp":    0x26, // VK_UP
+	"ArrowRight": 0x27, // VK_RIGHT
+	"ArrowDown":  0x28, // VK_DOWN
 
 	// 符號鍵
 	"Minus":        0xBD, // VK_OEM_MINUS (-)
@@ -75,9 +75,9 @@ var codeMap = map[string]uint16{
 	"Slash":        0xBF, // VK_OEM_2 (/)
 
 	// 數字小鍵盤 (Numpad)
-	"Numpad0":        0x60, "Numpad1": 0x61, "Numpad2": 0x62,
-	"Numpad3":        0x63, "Numpad4": 0x64, "Numpad5": 0x65,
-	"Numpad6":        0x66, "Numpad7": 0x67, "Numpad8": 0x68,
+	"Numpad0": 0x60, "Numpad1": 0x61, "Numpad2": 0x62,
+	"Numpad3": 0x63, "Numpad4": 0x64, "Numpad5": 0x65,
+	"Numpad6": 0x66, "Numpad7": 0x67, "Numpad8": 0x68,
 	"Numpad9":        0x69,
 	"NumpadMultiply": 0x6A, // *
 	"NumpadAdd":      0x6B, // +

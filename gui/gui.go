@@ -6,44 +6,48 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"kvm/auth"
 	"kvm/clipboard"
+	"kvm/config"
 )
 
 var (
-	modUser32           = syscall.NewLazyDLL("user32.dll")
-	modKernel32         = syscall.NewLazyDLL("kernel32.dll")
-	modGdi32            = syscall.NewLazyDLL("gdi32.dll")
-	modShell32          = syscall.NewLazyDLL("shell32.dll")
+	modUser32   = syscall.NewLazyDLL("user32.dll")
+	modKernel32 = syscall.NewLazyDLL("kernel32.dll")
+	modGdi32    = syscall.NewLazyDLL("gdi32.dll")
+	modShell32  = syscall.NewLazyDLL("shell32.dll")
 
-	procRegisterClassExW = modUser32.NewProc("RegisterClassExW")
-	procCreateWindowExW  = modUser32.NewProc("CreateWindowExW")
-	procDefWindowProcW   = modUser32.NewProc("DefWindowProcW")
-	procShowWindow       = modUser32.NewProc("ShowWindow")
-	procUpdateWindow     = modUser32.NewProc("UpdateWindow")
-	procGetMessageW      = modUser32.NewProc("GetMessageW")
-	procTranslateMessage = modUser32.NewProc("TranslateMessage")
-	procDispatchMessageW = modUser32.NewProc("DispatchMessageW")
-	procPostQuitMessage  = modUser32.NewProc("PostQuitMessage")
-	procSendMessageW     = modUser32.NewProc("SendMessageW")
-	procSetWindowTextW   = modUser32.NewProc("SetWindowTextW")
-	procGetWindowTextW   = modUser32.NewProc("GetWindowTextW")
-	procMessageBoxW      = modUser32.NewProc("MessageBoxW")
-	procDestroyWindow    = modUser32.NewProc("DestroyWindow")
+	procRegisterClassExW    = modUser32.NewProc("RegisterClassExW")
+	procCreateWindowExW     = modUser32.NewProc("CreateWindowExW")
+	procDefWindowProcW      = modUser32.NewProc("DefWindowProcW")
+	procShowWindow          = modUser32.NewProc("ShowWindow")
+	procUpdateWindow        = modUser32.NewProc("UpdateWindow")
+	procSetTimer            = modUser32.NewProc("SetTimer")
+	procKillTimer           = modUser32.NewProc("KillTimer")
+	procGetMessageW         = modUser32.NewProc("GetMessageW")
+	procTranslateMessage    = modUser32.NewProc("TranslateMessage")
+	procDispatchMessageW    = modUser32.NewProc("DispatchMessageW")
+	procPostQuitMessage     = modUser32.NewProc("PostQuitMessage")
+	procSendMessageW        = modUser32.NewProc("SendMessageW")
+	procSetWindowTextW      = modUser32.NewProc("SetWindowTextW")
+	procGetWindowTextW      = modUser32.NewProc("GetWindowTextW")
+	procMessageBoxW         = modUser32.NewProc("MessageBoxW")
+	procDestroyWindow       = modUser32.NewProc("DestroyWindow")
 	procSetForegroundWindow = modUser32.NewProc("SetForegroundWindow")
-	procGetCursorPos     = modUser32.NewProc("GetCursorPos")
-	procCreatePopupMenu  = modUser32.NewProc("CreatePopupMenu")
-	procAppendMenuW      = modUser32.NewProc("AppendMenuW")
-	procTrackPopupMenu   = modUser32.NewProc("TrackPopupMenu")
-	procDestroyMenu      = modUser32.NewProc("DestroyMenu")
-	procLoadIconW        = modUser32.NewProc("LoadIconW")
+	procGetCursorPos        = modUser32.NewProc("GetCursorPos")
+	procCreatePopupMenu     = modUser32.NewProc("CreatePopupMenu")
+	procAppendMenuW         = modUser32.NewProc("AppendMenuW")
+	procTrackPopupMenu      = modUser32.NewProc("TrackPopupMenu")
+	procDestroyMenu         = modUser32.NewProc("DestroyMenu")
+	procLoadIconW           = modUser32.NewProc("LoadIconW")
 
 	procGetModuleHandleW = modKernel32.NewProc("GetModuleHandleW")
 	procGetConsoleWindow = modKernel32.NewProc("GetConsoleWindow")
 
-	procGetStockObject   = modGdi32.NewProc("GetStockObject")
+	procGetStockObject = modGdi32.NewProc("GetStockObject")
 
 	procShell_NotifyIconW = modShell32.NewProc("Shell_NotifyIconW")
 )
@@ -52,47 +56,47 @@ const (
 	SW_HIDE = 0
 	SW_SHOW = 5
 
-	WS_OVERLAPPED   = 0x00000000
-	WS_CAPTION      = 0x00C00000
-	WS_SYSMENU      = 0x00080000
-	WS_MINIMIZEBOX  = 0x00020000
-	WS_VISIBLE      = 0x10000000
-	WS_CHILD        = 0x40000000
-	WS_BORDER       = 0x00800000
+	WS_OVERLAPPED  = 0x00000000
+	WS_CAPTION     = 0x00C00000
+	WS_SYSMENU     = 0x00080000
+	WS_MINIMIZEBOX = 0x00020000
+	WS_VISIBLE     = 0x10000000
+	WS_CHILD       = 0x40000000
+	WS_BORDER      = 0x00800000
 
-	BS_PUSHBUTTON   = 0x00000000
-	ES_AUTOHSCROLL  = 0x00000080
-	ES_READONLY     = 0x00000800
-	SS_LEFT         = 0x00000000
+	BS_PUSHBUTTON  = 0x00000000
+	ES_AUTOHSCROLL = 0x00000080
+	ES_READONLY    = 0x00000800
+	SS_LEFT        = 0x00000000
 
-	WM_DESTROY       = 0x0002
-	WM_CLOSE         = 0x0010
-	WM_COMMAND       = 0x0111
-	WM_SETFONT       = 0x0030
-	WM_USER          = 0x0400
-	WM_TRAYICON      = WM_USER + 101
+	WM_DESTROY  = 0x0002
+	WM_CLOSE    = 0x0010
+	WM_COMMAND  = 0x0111
+	WM_SETFONT  = 0x0030
+	WM_USER     = 0x0400
+	WM_TRAYICON = WM_USER + 101
 
 	WM_LBUTTONUP     = 0x0202
 	WM_LBUTTONDBLCLK = 0x0203
 	WM_RBUTTONUP     = 0x0205
 
-	NIM_ADD          = 0x00000000
-	NIM_MODIFY       = 0x00000001
-	NIM_DELETE       = 0x00000002
+	NIM_ADD    = 0x00000000
+	NIM_MODIFY = 0x00000001
+	NIM_DELETE = 0x00000002
 
-	NIF_MESSAGE      = 0x00000001
-	NIF_ICON         = 0x00000002
-	NIF_TIP          = 0x00000004
-	NIF_INFO         = 0x00000010
+	NIF_MESSAGE = 0x00000001
+	NIF_ICON    = 0x00000002
+	NIF_TIP     = 0x00000004
+	NIF_INFO    = 0x00000010
 
-	NIIF_INFO        = 0x00000001
+	NIIF_INFO = 0x00000001
 
-	MF_STRING        = 0x00000000
-	MF_SEPARATOR     = 0x00000800
+	MF_STRING    = 0x00000000
+	MF_SEPARATOR = 0x00000800
 
-	TPM_RIGHTBUTTON  = 0x0002
+	TPM_RIGHTBUTTON = 0x0002
 
-	IDI_APPLICATION  = 32512
+	IDI_APPLICATION = 32512
 
 	DEFAULT_GUI_FONT = 17
 
@@ -105,48 +109,52 @@ const (
 	MB_SETFOREGROUND = 0x00010000
 	MB_TOPMOST       = 0x00040000
 
-	WM_SETICON       = 0x0080
-	ICON_SMALL       = 0
-	ICON_BIG         = 1
+	WM_SETICON = 0x0080
+	ICON_SMALL = 0
+	ICON_BIG   = 1
+	EN_CHANGE  = 0x0300
 )
 
 // 控制項 ID
 const (
-	ID_BTN_COPY_URL = 1001
-	ID_BTN_REFRESH  = 1002
-	ID_BTN_KICK_ALL = 1003
-	ID_EDIT_VIEW    = 1004
-	ID_EDIT_STD     = 1005
-	ID_EDIT_ADM     = 1006
+	ID_BTN_COPY_URL  = 1001
+	ID_BTN_REFRESH   = 1002
+	ID_BTN_KICK_ALL  = 1003
+	ID_EDIT_VIEW     = 1004
+	ID_EDIT_STD      = 1005
+	ID_EDIT_ADM      = 1006
+	ID_BTN_SAVE_PWD  = 1007
+	ID_BTN_APPLY_PWD = 1008
+	ID_URL_SELECT    = 1009
 
 	// 審核視窗控制項 ID
-	ID_PROMPT_VIEW  = 2001
-	ID_PROMPT_STD   = 2002
-	ID_PROMPT_ADM   = 2003
-	ID_PROMPT_REJ   = 2004
+	ID_PROMPT_VIEW = 2001
+	ID_PROMPT_STD  = 2002
+	ID_PROMPT_ADM  = 2003
+	ID_PROMPT_REJ  = 2004
 
 	// 系統匣選單項目 ID
-	ID_TRAY_SHOW    = 3001
-	ID_TRAY_COPY    = 3002
-	ID_TRAY_KICK    = 3003
-	ID_TRAY_EXIT    = 3004
+	ID_TRAY_SHOW = 3001
+	ID_TRAY_COPY = 3002
+	ID_TRAY_KICK = 3003
+	ID_TRAY_EXIT = 3004
 )
 
 // Windows NOTIFYICONDATAW 系統匣圖示結構
 type NOTIFYICONDATAW struct {
-	CbSize           uint32
-	HWnd             uintptr
-	UID              uint32
-	UFlags           uint32
-	UCallbackMessage uint32
-	HIcon            uintptr
-	SzTip            [128]uint16
-	DwState          uint32
-	DwStateMask      uint32
-	SzInfo           [256]uint16
+	CbSize            uint32
+	HWnd              uintptr
+	UID               uint32
+	UFlags            uint32
+	UCallbackMessage  uint32
+	HIcon             uintptr
+	SzTip             [128]uint16
+	DwState           uint32
+	DwStateMask       uint32
+	SzInfo            [256]uint16
 	UTimeoutOrVersion uint32
-	SzInfoTitle      [64]uint16
-	DwInfoFlags      uint32
+	SzInfoTitle       [64]uint16
+	DwInfoFlags       uint32
 }
 
 type WNDCLASSEXW struct {
@@ -166,17 +174,21 @@ type WNDCLASSEXW struct {
 
 // 主機 GUI 管理視窗
 type HostGUI struct {
-	mu           sync.Mutex
-	hwnd         uintptr
-	authMgr      *auth.AuthManager
-	serverURL    string
-	onKickAll    func()
-	editViewHwnd uintptr
-	editStdHwnd  uintptr
-	editAdmHwnd  uintptr
-	statusTextHwnd uintptr
+	mu              sync.Mutex
+	hwnd            uintptr
+	authMgr         *auth.AuthManager
+	serverURL       string
+	serverURLs      []string
+	urlCombo        uintptr
+	onKickAll       func()
+	onDisplayChange func()
+	editViewHwnd    uintptr
+	editStdHwnd     uintptr
+	editAdmHwnd     uintptr
+	statusTextHwnd  uintptr
 	clientsTextHwnd uintptr
-	hFont        uintptr
+	hFont           uintptr
+	ready           bool
 }
 
 var globalGUI *HostGUI
@@ -207,11 +219,11 @@ func HideConsoleWindow() {
 }
 
 // 建立並啟動被控端原生 GUI 視窗
-func StartHostGUI(authMgr *auth.AuthManager, serverURL string, onKickAll func()) *HostGUI {
+func StartHostGUI(authMgr *auth.AuthManager, serverURLs []string, onKickAll func(), onDisplayChange func()) *HostGUI {
 	gui := &HostGUI{
 		authMgr:   authMgr,
-		serverURL: serverURL,
-		onKickAll: onKickAll,
+		serverURL: serverURLs[0], serverURLs: serverURLs,
+		onKickAll: onKickAll, onDisplayChange: onDisplayChange,
 	}
 	globalGUI = gui
 
@@ -226,7 +238,10 @@ func StartHostGUI(authMgr *auth.AuthManager, serverURL string, onKickAll func())
 
 // 更新當前在線客戶端數量與資訊顯示
 func (g *HostGUI) UpdateClientStats(count int, lastIP string) {
-	if g.clientsTextHwnd == 0 {
+	g.mu.Lock()
+	hwnd := g.clientsTextHwnd
+	g.mu.Unlock()
+	if hwnd == 0 {
 		return
 	}
 	var text string
@@ -236,13 +251,14 @@ func (g *HostGUI) UpdateClientStats(count int, lastIP string) {
 		text = fmt.Sprintf("連線狀態: 🟢 已連線 (%d 人在線，最新: %s)", count, lastIP)
 	}
 	pText, _ := syscall.UTF16PtrFromString(text)
-	procSetWindowTextW.Call(g.clientsTextHwnd, uintptr(unsafe.Pointer(pText)))
+	procSetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(pText)))
 }
 
 // 彈出連線授權審核視窗 (當遠端點擊「發起請求授權」時)
 func (g *HostGUI) ShowAuthPrompt(req *auth.AuthRequest) {
 	go func() {
 		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 		g.runPromptDialog(req)
 	}()
 }
@@ -308,6 +324,11 @@ func showTrayMenu(hwnd uintptr) {
 // 主視窗視窗過程回呼 (WndProc)
 func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 	switch msg {
+	case 0x007e:
+		if globalGUI != nil && globalGUI.onDisplayChange != nil {
+			globalGUI.onDisplayChange()
+		}
+		return 0
 	case WM_TRAYICON:
 		switch lParam {
 		case WM_LBUTTONUP, WM_LBUTTONDBLCLK:
@@ -325,6 +346,15 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 
 	case WM_COMMAND:
 		wmId := int(wParam & 0xFFFF)
+		wmEvent := int((wParam >> 16) & 0xFFFF)
+		if wmId == ID_URL_SELECT && wmEvent == 1 && globalGUI != nil {
+			index, _, _ := procSendMessageW.Call(globalGUI.urlCombo, 0x147, 0, 0)
+			if int(index) < len(globalGUI.serverURLs) {
+				globalGUI.serverURL = globalGUI.serverURLs[index]
+			}
+			return 0
+		}
+
 		switch wmId {
 		case ID_TRAY_SHOW:
 			procShowWindow.Call(hwnd, uintptr(SW_SHOW))
@@ -338,9 +368,48 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 				procMessageBoxW.Call(hwnd, uintptr(unsafe.Pointer(msgText)), uintptr(unsafe.Pointer(title)), uintptr(MB_OK|MB_ICONINFO))
 			}
 
+		case ID_BTN_SAVE_PWD, ID_BTN_APPLY_PWD:
+			if globalGUI != nil && globalGUI.authMgr != nil {
+				v := getControlText(globalGUI.editViewHwnd)
+				s := getControlText(globalGUI.editStdHwnd)
+				a := getControlText(globalGUI.editAdmHwnd)
+
+				if err := globalGUI.authMgr.ApplyPasswords(v, s, a); err != nil {
+					ShowFatalError("密碼未套用", "%v", err)
+					return 0
+				}
+				if globalGUI.onKickAll != nil {
+					globalGUI.onKickAll()
+				}
+				if wmId == ID_BTN_APPLY_PWD {
+					return 0
+				}
+
+				// 儲存至本地設定檔 (config.json)
+				err := config.SaveConfig(&config.AppConfig{
+					RememberPasswords: true,
+					ViewPassword:      v,
+					StandardPassword:  s,
+					AdminPassword:     a,
+				})
+
+				title, _ := syscall.UTF16PtrFromString("密碼儲存成功")
+				var msgText *uint16
+				if err != nil {
+					msgText, _ = syscall.UTF16PtrFromString(fmt.Sprintf("密碼已於記憶體中生效，但寫入設定檔失敗：%v", err))
+					procMessageBoxW.Call(hwnd, uintptr(unsafe.Pointer(msgText)), uintptr(unsafe.Pointer(title)), uintptr(MB_OK|MB_ICONERROR))
+				} else {
+					msgText, _ = syscall.UTF16PtrFromString("✅ 自訂密碼已成功儲存！\n下次啟動 NanoDesk 將自動載入並套用這組密碼。")
+					procMessageBoxW.Call(hwnd, uintptr(unsafe.Pointer(msgText)), uintptr(unsafe.Pointer(title)), uintptr(MB_OK|MB_ICONINFO))
+				}
+			}
+
 		case ID_BTN_REFRESH:
 			if globalGUI != nil && globalGUI.authMgr != nil {
 				globalGUI.authMgr.GenerateRandomPasswords()
+				if globalGUI.onKickAll != nil {
+					globalGUI.onKickAll()
+				}
 				v, s, a := globalGUI.authMgr.GetPasswords()
 				pV, _ := syscall.UTF16PtrFromString(v)
 				pS, _ := syscall.UTF16PtrFromString(s)
@@ -377,6 +446,16 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 
 	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
 	return ret
+}
+
+// 讀取 Win32 控制項中的文字內容 (支援特殊符號與任意 UTF-16 字串)
+func getControlText(hCtrl uintptr) string {
+	if hCtrl == 0 {
+		return ""
+	}
+	buf := make([]uint16, 256)
+	procGetWindowTextW.Call(hCtrl, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return syscall.UTF16ToString(buf)
 }
 
 // 建立單一純原生 Win32 控制項輔助函數
@@ -453,37 +532,48 @@ func (g *HostGUI) runWindowLoop() {
 
 	// 1. 伺服器狀態與連線位址區塊
 	g.createControl("STATIC", "服務狀態: 🟢 極速串流引擎運行中 (30 FPS H.264)", SS_LEFT, 20, 15, 420, 20, 0)
-	g.createControl("STATIC", fmt.Sprintf("連線網址: %s", g.serverURL), SS_LEFT, 20, 40, 320, 20, 0)
+	g.urlCombo = g.createControl("COMBOBOX", "", WS_BORDER|0x0003|0x00200000, 20, 36, 320, 160, ID_URL_SELECT)
+	for _, url := range g.serverURLs {
+		p, _ := syscall.UTF16PtrFromString(url)
+		procSendMessageW.Call(g.urlCombo, 0x143, 0, uintptr(unsafe.Pointer(p)))
+	}
+	procSendMessageW.Call(g.urlCombo, 0x14e, 0, 0)
 	g.createControl("BUTTON", "📋 複製網址", BS_PUSHBUTTON, 350, 36, 90, 26, ID_BTN_COPY_URL)
 
 	// 分隔裝飾
 	g.createControl("STATIC", "──────────────────────────────────────────────", SS_LEFT, 20, 70, 420, 15, 0)
 
 	// 2. 三級獨立存取密碼區塊
-	g.createControl("STATIC", "🛡️ 三級獨立存取密碼設定 (輸入密碼自動賦予對應權限):", SS_LEFT, 20, 90, 420, 20, 0)
+	g.createControl("STATIC", "🛡️ 三級獨立存取密碼設定 (支援英文、數字與特殊符號):", SS_LEFT, 20, 90, 420, 20, 0)
 
 	vPwd, sPwd, aPwd := g.authMgr.GetPasswords()
 
 	// 僅觀看
 	g.createControl("STATIC", "👁️ 僅觀看密碼:", SS_LEFT, 25, 122, 110, 20, 0)
-	g.editViewHwnd = g.createControl("EDIT", vPwd, WS_BORDER|ES_AUTOHSCROLL, 140, 120, 180, 24, ID_EDIT_VIEW)
+	g.editViewHwnd = g.createControl("EDIT", vPwd, WS_BORDER|ES_AUTOHSCROLL, 140, 120, 175, 24, ID_EDIT_VIEW)
 
 	// 一般控制
 	g.createControl("STATIC", "🎮 一般控制密碼:", SS_LEFT, 25, 157, 110, 20, 0)
-	g.editStdHwnd = g.createControl("EDIT", sPwd, WS_BORDER|ES_AUTOHSCROLL, 140, 155, 180, 24, ID_EDIT_STD)
+	g.editStdHwnd = g.createControl("EDIT", sPwd, WS_BORDER|ES_AUTOHSCROLL, 140, 155, 175, 24, ID_EDIT_STD)
 
 	// 完全控制
 	g.createControl("STATIC", "👑 完全控制密碼:", SS_LEFT, 25, 192, 110, 20, 0)
-	g.editAdmHwnd = g.createControl("EDIT", aPwd, WS_BORDER|ES_AUTOHSCROLL, 140, 190, 180, 24, ID_EDIT_ADM)
+	g.editAdmHwnd = g.createControl("EDIT", aPwd, WS_BORDER|ES_AUTOHSCROLL, 140, 190, 175, 24, ID_EDIT_ADM)
+
+	// 儲存自訂密碼按鈕
+	g.createControl("BUTTON", "套用 (不儲存)", BS_PUSHBUTTON, 330, 122, 110, 25, ID_BTN_APPLY_PWD)
+	g.createControl("BUTTON", "💾 套用並儲存", BS_PUSHBUTTON, 330, 155, 110, 25, ID_BTN_SAVE_PWD)
 
 	// 隨機重設密碼按鈕
-	g.createControl("BUTTON", "🔄 隨機換一組", BS_PUSHBUTTON, 335, 153, 105, 30, ID_BTN_REFRESH)
+	g.createControl("BUTTON", "🔄 隨機並套用", BS_PUSHBUTTON, 330, 188, 110, 25, ID_BTN_REFRESH)
 
 	// 分隔裝飾
 	g.createControl("STATIC", "──────────────────────────────────────────────", SS_LEFT, 20, 225, 420, 15, 0)
 
 	// 3. 連線狀態與安全特權說明
+	g.mu.Lock()
 	g.clientsTextHwnd = g.createControl("STATIC", "連線狀態: 待命中 (尚無外部客戶端連入)", SS_LEFT, 20, 245, 420, 20, 0)
+	g.mu.Unlock()
 	g.createControl("STATIC", "💡 最高特權保護: 被控端主人一碰實體鍵鼠，即刻壓制並奪回控制！", SS_LEFT, 20, 275, 430, 20, 0)
 
 	// 4. 緊急一鍵斷開按鈕
@@ -491,6 +581,7 @@ func (g *HostGUI) runWindowLoop() {
 
 	procShowWindow.Call(hwnd, uintptr(SW_SHOW))
 	procUpdateWindow.Call(hwnd)
+	g.ready = true
 
 	// 註冊 Windows 系統匣常駐圖示
 	addTrayIcon(hwnd)
@@ -517,35 +608,55 @@ func (g *HostGUI) runWindowLoop() {
 }
 
 // 連線授權請求彈窗視窗過程
-var activePromptHwnd uintptr
-var currentPromptReq *auth.AuthRequest
+var promptRequests sync.Map
+var promptClassOnce sync.Once
+var promptCallback = syscall.NewCallback(promptWndProc)
 
 func promptWndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
+	entry, exists := promptRequests.Load(hwnd)
+	var req *auth.AuthRequest
+	if exists {
+		req = entry.(*auth.AuthRequest)
+	}
 	switch msg {
 	case WM_COMMAND:
 		wmId := int(wParam & 0xFFFF)
-		if currentPromptReq != nil && globalGUI != nil && globalGUI.authMgr != nil {
+		if req != nil && globalGUI != nil && globalGUI.authMgr != nil {
 			switch wmId {
 			case ID_PROMPT_VIEW:
-				globalGUI.authMgr.ApproveRequest(currentPromptReq.ID, auth.RoleView)
+				globalGUI.authMgr.ApproveRequest(req.ID, auth.RoleView)
 				procDestroyWindow.Call(hwnd)
 				return 0
 			case ID_PROMPT_STD:
-				globalGUI.authMgr.ApproveRequest(currentPromptReq.ID, auth.RoleStandard)
+				globalGUI.authMgr.ApproveRequest(req.ID, auth.RoleStandard)
 				procDestroyWindow.Call(hwnd)
 				return 0
 			case ID_PROMPT_ADM:
-				globalGUI.authMgr.ApproveRequest(currentPromptReq.ID, auth.RoleAdmin)
+				globalGUI.authMgr.ApproveRequest(req.ID, auth.RoleAdmin)
 				procDestroyWindow.Call(hwnd)
 				return 0
 			case ID_PROMPT_REJ:
-				globalGUI.authMgr.RejectRequest(currentPromptReq.ID)
+				globalGUI.authMgr.RejectRequest(req.ID)
 				procDestroyWindow.Call(hwnd)
 				return 0
 			}
 		}
+	case 0x0113:
+		if req != nil && time.Since(req.CreatedAt) >= time.Minute {
+			globalGUI.authMgr.RejectRequest(req.ID)
+			procDestroyWindow.Call(hwnd)
+		}
+		return 0
+	case WM_CLOSE:
+		if req != nil {
+			globalGUI.authMgr.RejectRequest(req.ID)
+		}
+		procDestroyWindow.Call(hwnd)
+		return 0
 	case WM_DESTROY:
-		activePromptHwnd = 0
+		procKillTimer.Call(hwnd, 1)
+		promptRequests.Delete(hwnd)
+		procPostQuitMessage.Call(0)
 		return 0
 	}
 	ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
@@ -554,7 +665,9 @@ func promptWndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uin
 
 // 彈出審核對話框
 func (g *HostGUI) runPromptDialog(req *auth.AuthRequest) {
-	currentPromptReq = req
+	if time.Since(req.CreatedAt) >= time.Minute {
+		return
+	}
 	hInstance, _, _ := procGetModuleHandleW.Call(0)
 	className, _ := syscall.UTF16PtrFromString("NanoDeskAuthPromptClass")
 
@@ -566,14 +679,14 @@ func (g *HostGUI) runPromptDialog(req *auth.AuthRequest) {
 	wndClass := WNDCLASSEXW{
 		CbSize:        uint32(unsafe.Sizeof(WNDCLASSEXW{})),
 		Style:         0,
-		LpfnWndProc:   syscall.NewCallback(promptWndProc),
+		LpfnWndProc:   promptCallback,
 		HInstance:     hInstance,
 		HIcon:         hIcon,
 		HIconSm:       hIcon,
 		HbrBackground: uintptr(COLOR_BTNFACE + 1),
 		LpszClassName: className,
 	}
-	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wndClass)))
+	promptClassOnce.Do(func() { procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wndClass))) })
 
 	title, _ := syscall.UTF16PtrFromString("🔔 NanoDesk - 收到遠端連線請求！")
 	hwnd, _, _ := procCreateWindowExW.Call(
@@ -584,7 +697,12 @@ func (g *HostGUI) runPromptDialog(req *auth.AuthRequest) {
 		150, 150, 420, 220,
 		0, 0, hInstance, 0,
 	)
-	activePromptHwnd = hwnd
+	if hwnd == 0 {
+		g.authMgr.RejectRequest(req.ID)
+		return
+	}
+	promptRequests.Store(hwnd, req)
+	procSetTimer.Call(hwnd, 1, 1000, 0)
 
 	if hIcon != 0 {
 		procSendMessageW.Call(hwnd, uintptr(WM_SETICON), uintptr(ICON_SMALL), hIcon)
@@ -635,7 +753,7 @@ func (g *HostGUI) runPromptDialog(req *auth.AuthRequest) {
 		Pt      struct{ X, Y int32 }
 	}
 	var msg MSG
-	for activePromptHwnd != 0 {
+	for {
 		ret, _, _ := procGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
 		if int32(ret) <= 0 {
 			break

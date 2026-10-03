@@ -20,9 +20,10 @@ struct H264EncoderContext {
     int alignedHeight;
     int fps;
     int bitrate;
-    int frameIndex;
+    LONGLONG frameIndex;
 
     IMFTransform* pTransform;
+    IMFActivate* pActivation;
     bool providesSamples;
 
     std::vector<BYTE> nv12Buffer;
@@ -88,11 +89,14 @@ static void BGRA_To_NV12(const BYTE* bgra, BYTE* nv12, int srcW, int srcH, int d
 }
 
 void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (width <= 0 || height <= 0 || width > 16384 || height > 16384) return NULL;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return NULL;
 
-    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
     if (FAILED(hr)) {
         printf("  [H264 MFT] MFStartup 失敗: 0x%08X\n", (unsigned int)hr);
+        CoUninitialize();
         return NULL;
     }
 
@@ -108,6 +112,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
     ctx->bitrate = (bitrateKbps > 0 ? bitrateKbps : 2000) * 1000;
     ctx->frameIndex = 0;
     ctx->pTransform = NULL;
+    ctx->pActivation = NULL;
     ctx->providesSamples = false;
     ctx->pInSample = NULL;
     ctx->pInMediaBuffer = NULL;
@@ -145,6 +150,8 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
         WCHAR selName[128] = { 0 };
         ppActivate[selectedIdx]->GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, selName, 128, NULL);
         if (SUCCEEDED(hr)) {
+            ctx->pActivation = ppActivate[selectedIdx];
+            ctx->pActivation->AddRef();
             wprintf(L"  -> 【選定啟用】: %s\n", selName[0] ? selName : L"H264 MFT");
         }
 
@@ -154,7 +161,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
 
     if (!ctx->pTransform) {
         printf("  [H264 MFT] 找不到任何 H.264 編碼器！\n");
-        delete ctx;
+        H264_DestroyEncoder(ctx);
         return NULL;
     }
 
@@ -216,9 +223,10 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
 
     // 3. 設定輸出類型 (H.264)
     IMFMediaType* pOutType = NULL;
-    MFCreateMediaType(&pOutType);
+    if (FAILED(MFCreateMediaType(&pOutType))) { H264_DestroyEncoder(ctx); return NULL; }
     pOutType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     pOutType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+    pOutType->SetUINT32(MF_MT_MPEG2_PROFILE, 66);
     pOutType->SetUINT32(MF_MT_AVG_BITRATE, ctx->bitrate);
     MFSetAttributeSize(pOutType, MF_MT_FRAME_SIZE, alignedW, alignedH);
     MFSetAttributeRatio(pOutType, MF_MT_FRAME_RATE, ctx->fps, 1);
@@ -235,7 +243,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
 
     // 4. 設定輸入類型 (NV12)
     IMFMediaType* pInType = NULL;
-    MFCreateMediaType(&pInType);
+    if (FAILED(MFCreateMediaType(&pInType))) { H264_DestroyEncoder(ctx); return NULL; }
     pInType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
     pInType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
     MFSetAttributeSize(pInType, MF_MT_FRAME_SIZE, alignedW, alignedH);
@@ -255,9 +263,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
     int nv12Size = (alignedW * alignedH * 3) / 2;
     ctx->nv12Buffer.resize(nv12Size);
 
-    MFCreateMemoryBuffer(nv12Size, &ctx->pInMediaBuffer);
-    MFCreateSample(&ctx->pInSample);
-    ctx->pInSample->AddBuffer(ctx->pInMediaBuffer);
+    if (FAILED(MFCreateMemoryBuffer(nv12Size, &ctx->pInMediaBuffer)) || FAILED(MFCreateSample(&ctx->pInSample)) || FAILED(ctx->pInSample->AddBuffer(ctx->pInMediaBuffer))) { H264_DestroyEncoder(ctx); return NULL; }
 
     MFT_OUTPUT_STREAM_INFO streamInfo;
     memset(&streamInfo, 0, sizeof(streamInfo));
@@ -266,9 +272,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
     ctx->outBufferSize = (streamInfo.cbSize > 0) ? streamInfo.cbSize : (alignedW * alignedH);
 
     if (!ctx->providesSamples) {
-        MFCreateMemoryBuffer(ctx->outBufferSize, &ctx->pOutMediaBuffer);
-        MFCreateSample(&ctx->pOutSample);
-        ctx->pOutSample->AddBuffer(ctx->pOutMediaBuffer);
+        if (FAILED(MFCreateMemoryBuffer(ctx->outBufferSize, &ctx->pOutMediaBuffer)) || FAILED(MFCreateSample(&ctx->pOutSample)) || FAILED(ctx->pOutSample->AddBuffer(ctx->pOutMediaBuffer))) { H264_DestroyEncoder(ctx); return NULL; }
     }
 
     ctx->pTransform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
@@ -288,7 +292,7 @@ int H264_EncodeFrame(void* handle, const BYTE* bgraPixels, BYTE* outNalu, int ma
 
     // 2. 寫入輸入緩衝區
     BYTE* pDst = NULL;
-    ctx->pInMediaBuffer->Lock(&pDst, NULL, NULL);
+    if (FAILED(ctx->pInMediaBuffer->Lock(&pDst, NULL, NULL)) || !pDst) return -6;
     memcpy(pDst, ctx->nv12Buffer.data(), ctx->nv12Buffer.size());
     ctx->pInMediaBuffer->Unlock();
     ctx->pInMediaBuffer->SetCurrentLength((DWORD)ctx->nv12Buffer.size());
@@ -317,13 +321,15 @@ int H264_EncodeFrame(void* handle, const BYTE* bgraPixels, BYTE* outNalu, int ma
     DWORD dwStatus = 0;
     hr = ctx->pTransform->ProcessOutput(0, 1, &outputBuffer, &dwStatus);
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+        if (ctx->providesSamples && outputBuffer.pSample) outputBuffer.pSample->Release();
+        if (outputBuffer.pEvents) outputBuffer.pEvents->Release();
         return 0; // 緩衝中，需更多幀
     }
     if (FAILED(hr)) {
         if (ctx->frameIndex <= 3) {
             printf("  [除錯] ProcessOutput 失敗: 0x%08X\n", (unsigned int)hr);
         }
-        if (outputBuffer.pSample) outputBuffer.pSample->Release();
+        if (ctx->providesSamples && outputBuffer.pSample) outputBuffer.pSample->Release();
         if (outputBuffer.pEvents) outputBuffer.pEvents->Release();
         return -3;
     }
@@ -338,14 +344,25 @@ int H264_EncodeFrame(void* handle, const BYTE* bgraPixels, BYTE* outNalu, int ma
     IMFMediaBuffer* pOutBuf = NULL;
     pSample->GetBufferByIndex(0, &pOutBuf);
     if (!pOutBuf) {
-        if (outputBuffer.pSample) outputBuffer.pSample->Release();
+        if (ctx->providesSamples && outputBuffer.pSample) outputBuffer.pSample->Release();
         if (outputBuffer.pEvents) outputBuffer.pEvents->Release();
         return -5;
     }
 
     BYTE* pEncData = NULL;
     DWORD encLen = 0;
-    pOutBuf->Lock(&pEncData, NULL, &encLen);
+    if (FAILED(pOutBuf->Lock(&pEncData, NULL, &encLen)) || !pEncData) {
+        pOutBuf->Release();
+        if (ctx->providesSamples && outputBuffer.pSample) outputBuffer.pSample->Release();
+        if (outputBuffer.pEvents) outputBuffer.pEvents->Release();
+        return -6;
+    }
+    if (encLen > (DWORD)maxOutLen) {
+        pOutBuf->Unlock(); pOutBuf->Release();
+        if (ctx->providesSamples && outputBuffer.pSample) outputBuffer.pSample->Release();
+        if (outputBuffer.pEvents) outputBuffer.pEvents->Release();
+        return -7; // Never send a truncated access unit.
+    }
 
     int copyLen = (encLen < (DWORD)maxOutLen) ? encLen : maxOutLen;
     memcpy(outNalu, pEncData, copyLen);
@@ -396,6 +413,10 @@ void H264_DestroyEncoder(void* handle) {
     if (ctx->pTransform) {
         ctx->pTransform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
         ctx->pTransform->Release();
+    }
+    if (ctx->pActivation) {
+        ctx->pActivation->ShutdownObject();
+        ctx->pActivation->Release();
     }
     if (ctx->pInSample) ctx->pInSample->Release();
     if (ctx->pInMediaBuffer) ctx->pInMediaBuffer->Release();

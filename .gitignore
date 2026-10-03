@@ -19,3 +19,6 @@
 .idea/
 Thumbs.db
 Desktop.ini
+
+# 本地密碼組態設定檔
+config.json

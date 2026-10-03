@@ -81,43 +81,44 @@ func NewGDICapturer() *GDICapturer {
 	}
 }
 
+// NewCallback allocations live for the process lifetime. Reuse one callback,
+// serializing enumeration so it never retains a capturer or its pixel buffers.
+var gdiEnumerationMu sync.Mutex
+var gdiEnumerationList []Monitor
+var gdiEnumerationCallback = syscall.NewCallback(func(hMon, hdcMon, lprcMon, dwData uintptr) uintptr {
+	var mi monitorInfoExW
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+	ret, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi)))
+	if ret != 0 {
+		gdiEnumerationList = append(gdiEnumerationList, Monitor{
+			Index: len(gdiEnumerationList), Device: syscall.UTF16ToString(mi.SzDevice[:]),
+			X: int(mi.RcMonitor.Left), Y: int(mi.RcMonitor.Top),
+			Width: int(mi.RcMonitor.Right - mi.RcMonitor.Left), Height: int(mi.RcMonitor.Bottom - mi.RcMonitor.Top),
+			IsPrimary: mi.DwFlags&1 != 0,
+		})
+	}
+	return 1
+})
+
+func enumerateGDIMonitors() []Monitor {
+	gdiEnumerationMu.Lock()
+	defer gdiEnumerationMu.Unlock()
+	gdiEnumerationList = nil
+	procEnumDisplayMonitors.Call(0, 0, gdiEnumerationCallback, 0)
+	list := gdiEnumerationList
+	gdiEnumerationList = nil
+	return list
+}
+
 func (g *GDICapturer) Init() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.closeLocked()
 
 	// 啟用 Per-Monitor DPI 感知
 	procSetProcessDpiAwarenessContext.Call(^uintptr(3))
 
-	var list []Monitor
-	idx := 0
-
-	cb := syscall.NewCallback(func(hMon, hdcMon, lprcMon, dwData uintptr) uintptr {
-		var mi monitorInfoExW
-		mi.CbSize = uint32(unsafe.Sizeof(mi))
-
-		ret, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi)))
-		if ret != 0 {
-			name := syscall.UTF16ToString(mi.SzDevice[:])
-			w := int(mi.RcMonitor.Right - mi.RcMonitor.Left)
-			h := int(mi.RcMonitor.Bottom - mi.RcMonitor.Top)
-			isPri := (mi.DwFlags & 1) != 0
-
-			list = append(list, Monitor{
-				Index:     idx,
-				Device:    name,
-				X:         int(mi.RcMonitor.Left),
-				Y:         int(mi.RcMonitor.Top),
-				Width:     w,
-				Height:    h,
-				Rotation:  0, // GDI 已由系統轉正，永遠為 0
-				IsPrimary: isPri,
-			})
-			idx++
-		}
-		return 1
-	})
-
-	procEnumDisplayMonitors.Call(0, 0, cb, 0)
+	list := enumerateGDIMonitors()
 	if len(list) == 0 {
 		return fmt.Errorf("GDI 未偵測到活動螢幕")
 	}
@@ -152,11 +153,19 @@ func (g *GDICapturer) Init() error {
 			0, 0,
 		)
 		if hBitmap == 0 || pBits == nil {
+			if hBitmap != 0 {
+				procDeleteObject.Call(hBitmap)
+			}
 			procDeleteDC.Call(memDC)
 			continue
 		}
 
 		oldBitmap, _, _ := procSelectObject.Call(memDC, hBitmap)
+		if oldBitmap == 0 || oldBitmap == ^uintptr(0) {
+			procDeleteObject.Call(hBitmap)
+			procDeleteDC.Call(memDC)
+			continue
+		}
 		buf := unsafe.Slice((*byte)(pBits), m.Width*m.Height*4)
 
 		g.contexts[m.Index] = &gdiMonitorContext{
@@ -232,6 +241,11 @@ func (g *GDICapturer) CaptureFrame(monitorIdx int) (*Frame, error) {
 func (g *GDICapturer) Close() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.closeLocked()
+	return nil
+}
+
+func (g *GDICapturer) closeLocked() {
 
 	for _, ctx := range g.contexts {
 		if ctx.memDC != 0 {
@@ -246,5 +260,5 @@ func (g *GDICapturer) Close() error {
 	}
 	g.contexts = make(map[int]*gdiMonitorContext)
 	g.initialized = false
-	return nil
+	g.monitors = nil
 }

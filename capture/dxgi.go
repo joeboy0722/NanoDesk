@@ -130,5 +130,7 @@ func (d *DXGICapturer) Close() error {
 		C.DXGI_Close()
 		d.initialized = false
 	}
+	d.buffers = make(map[int][]byte)
+	d.monitors = nil
 	return nil
 }

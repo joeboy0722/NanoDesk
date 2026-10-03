@@ -95,8 +95,8 @@ int DXGI_Init() {
                     // 預先建立 Staging Texture 供 CPU 高速讀取
                     D3D11_TEXTURE2D_DESC texDesc;
                     memset(&texDesc, 0, sizeof(texDesc));
-                    texDesc.Width = w;
-                    texDesc.Height = h;
+                    texDesc.Width = (rot == 1 || rot == 3) ? h : w;
+                    texDesc.Height = (rot == 1 || rot == 3) ? w : h;
                     texDesc.MipLevels = 1;
                     texDesc.ArraySize = 1;
                     texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -172,6 +172,22 @@ int DXGI_GetMonitorInfo(int idx, int* width, int* height, int* rotation, int* x,
     return 0;
 }
 
+static void CopyRotatedPixels(const BYTE* src, BYTE* outPixels, int w, int h, int rotation, UINT pitch) {
+    // The duplication surface is unrotated. Map output desktop coordinates to it.
+    for (int y = 0; y < h; ++y) {
+        BYTE* dst = outPixels + (size_t)y * w * 4;
+        if (rotation == 0) { memcpy(dst, src + (size_t)y * pitch, (size_t)w * 4); continue; }
+        for (int x = 0; x < w; ++x) {
+            int sx = x, sy = y;
+            if (rotation == 1) { sx = y; sy = w - 1 - x; }
+            else if (rotation == 2) { sx = w - 1 - x; sy = h - 1 - y; }
+            else if (rotation == 3) { sx = h - 1 - y; sy = x; }
+            memcpy(dst + x * 4, src + (size_t)sy * pitch + sx * 4, 4);
+        }
+    }
+
+}
+
 int DXGI_CaptureFrame(int idx, unsigned char* outPixels, int timeoutMs) {
     if (idx < 0 || idx >= (int)g_monitors.size()) return -1;
     DXGIMonitorContext& m = g_monitors[idx];
@@ -197,6 +213,11 @@ int DXGI_CaptureFrame(int idx, unsigned char* outPixels, int timeoutMs) {
         return -3;
     }
 
+    D3D11_TEXTURE2D_DESC actual, expected;
+    pAcquiredTexture->GetDesc(&actual); m.pStagingTexture->GetDesc(&expected);
+    if (actual.Width != expected.Width || actual.Height != expected.Height) {
+        pAcquiredTexture->Release(); m.pDup->ReleaseFrame(); return -5;
+    }
     // 複製到常駐 Staging Texture
     m.pContext->CopyResource(m.pStagingTexture, pAcquiredTexture);
     pAcquiredTexture->Release();
@@ -213,28 +234,7 @@ int DXGI_CaptureFrame(int idx, unsigned char* outPixels, int timeoutMs) {
     int w = m.width;
     int h = m.height;
 
-    // 依據螢幕硬體旋轉方向處理 (180 度倒置翻轉校正)
-    if (m.rotation == 2) { // 180 度倒置
-        for (int y = 0; y < h; y++) {
-            const BYTE* srcRow = src + (y * mapped.RowPitch);
-            BYTE* dstRow = outPixels + ((h - 1 - y) * w * 4);
-            for (int x = 0; x < w; x++) {
-                int sX = x * 4;
-                int dX = (w - 1 - x) * 4;
-                dstRow[dX] = srcRow[sX];
-                dstRow[dX + 1] = srcRow[sX + 1];
-                dstRow[dX + 2] = srcRow[sX + 2];
-                dstRow[dX + 3] = 255;
-            }
-        }
-    } else {
-        // 正常 0 度：逐列複製處理 RowPitch
-        for (int y = 0; y < h; y++) {
-            const BYTE* srcRow = src + (y * mapped.RowPitch);
-            BYTE* dstRow = outPixels + (y * w * 4);
-            memcpy(dstRow, srcRow, w * 4);
-        }
-    }
+    CopyRotatedPixels(src,outPixels,w,h,m.rotation,mapped.RowPitch);
 
     m.pContext->Unmap(m.pStagingTexture, 0);
     m.pDup->ReleaseFrame();

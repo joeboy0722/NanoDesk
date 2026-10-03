@@ -14,21 +14,19 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"math/big"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"kvm/auth"
 	"kvm/capture"
 	"kvm/clipboard"
+	"kvm/config"
 	"kvm/encoder"
 	"kvm/gui"
 	"kvm/input"
@@ -43,7 +41,7 @@ var embeddedWebFS embed.FS
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true // 允許任何來源連線 (便利局域網各裝置)
+		return sameOrigin(r)
 	},
 }
 
@@ -62,30 +60,49 @@ var clientSeq uint64
 
 // Client 客戶端連線結構 (具備獨立存取權限、身分 Token 與多人協同狀態)
 type Client struct {
-	conn      *websocket.Conn
-	mu        sync.Mutex
-	id        string
-	name      string
-	color     string
-	ip        string
-	token     string
-	role      auth.Role
-	authed    bool
-	connected time.Time
-	sendChan  chan []byte // 視訊畫面封包非阻塞緩衝管道 (容量 10 幀)
-	closeOnce sync.Once
+	conn             *websocket.Conn
+	mu               sync.Mutex
+	id               string
+	name             string
+	color            string
+	ip               string
+	token            string
+	role             auth.Role
+	authed           bool
+	connected        time.Time
+	sendChan         chan []byte // 視訊畫面封包非阻塞緩衝管道 (容量 10 幀)
+	closeOnce        sync.Once
+	jsonChan         chan outboundMessage
+	done             chan struct{}
+	queueMu          sync.Mutex
+	needsKey         bool
+	clipboardEnabled bool
 }
 
 // 安全發送 JSON 控制文字訊息 (獨立逾時保護，不阻塞其他協程)
 func (c *Client) safeSendJSON(msg interface{}) error {
-	bytes, err := json.Marshal(msg)
+	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
-	return c.conn.WriteMessage(websocket.TextMessage, bytes)
+	select {
+	case <-c.done:
+		return fmt.Errorf("client closed")
+	default:
+	}
+	private := false
+	if m, ok := msg.(map[string]interface{}); ok {
+		if kind, ok := m["type"].(string); ok {
+			private = strings.HasPrefix(kind, "clipboard_")
+		}
+	}
+	select {
+	case c.jsonChan <- outboundMessage{data, private}:
+		return nil
+	default:
+		c.close()
+		return fmt.Errorf("client too slow")
+	}
 }
 
 // 每個 Client 專屬的寫入幫浦 (由單一協程管理連線寫入與 Ping 心跳，杜絕並發競爭與死鎖)
@@ -98,11 +115,36 @@ func (c *Client) writePump(h *StreamHub) {
 
 	for {
 		select {
+		case <-c.done:
+			return
+		case message := <-c.jsonChan:
+			if message.private && !h.clipboardAllowed(c) {
+				continue
+			}
+			h.mu.Lock()
+			authed := c.authed
+			valid := h.validLocked(c)
+			h.mu.Unlock()
+			if authed && !valid {
+				c.reject()
+				return
+			}
+			c.mu.Lock()
+			c.conn.SetWriteDeadline(time.Now().Add(time.Second))
+			err := c.conn.WriteMessage(websocket.TextMessage, message.data)
+			c.mu.Unlock()
+			if err != nil {
+				return
+			}
 		case data, ok := <-c.sendChan:
 			if !ok {
 				c.mu.Lock()
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				c.mu.Unlock()
+				return
+			}
+			if !h.authorized(c) {
+				c.reject()
 				return
 			}
 			c.mu.Lock()
@@ -114,6 +156,12 @@ func (c *Client) writePump(h *StreamHub) {
 			}
 
 		case <-ticker.C:
+			if !h.clientAlive(c) {
+				c.reject()
+				return
+			}
+			h.expireControl()
+			h.authMgr.Cleanup()
 			c.mu.Lock()
 			// 1. 發送標準底層 WebSocket Ping 封包
 			err1 := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(2*time.Second))
@@ -130,18 +178,24 @@ func (c *Client) writePump(h *StreamHub) {
 
 // 串流中樞管理器 (支援多人協同、輸入租約鎖與雷射筆廣播)
 type StreamHub struct {
-	mu                sync.Mutex
-	clients           map[*Client]bool
-	capEngine         capture.Capturer
-	monitors          []capture.Monitor
-	currentMonitor    int
-	encoder           *encoder.H264Encoder
-	requestKeyNext    bool
-	inputCtrl         *input.InputController
-	authMgr           *auth.AuthManager
-	hostGUI           *gui.HostGUI
-	currentController *Client
-	controllerExpiry  time.Time
+	mu                   sync.Mutex
+	inputMu              sync.Mutex
+	streamMu             sync.Mutex
+	wsSlots              chan struct{}
+	lastRecovery         time.Time
+	lastControlBroadcast time.Time
+	lastLocalOverride    bool
+	clients              map[*Client]bool
+	capEngine            capture.Capturer
+	monitors             []capture.Monitor
+	currentMonitor       int
+	encoder              *encoder.H264Encoder
+	requestKeyNext       bool
+	inputCtrl            remoteInput
+	authMgr              *auth.AuthManager
+	hostGUI              *gui.HostGUI
+	currentController    *Client
+	controllerExpiry     time.Time
 }
 
 func newStreamHub() (*StreamHub, error) {
@@ -169,9 +223,10 @@ func newStreamHub() (*StreamHub, error) {
 
 	hub := &StreamHub{
 		clients:        make(map[*Client]bool),
+		wsSlots:        make(chan struct{}, 64),
 		capEngine:      capEngine,
 		monitors:       monitors,
-		currentMonitor: 0,
+		currentMonitor: primaryMonitor(monitors),
 		requestKeyNext: true,
 		inputCtrl:      inputCtrl,
 	}
@@ -187,10 +242,6 @@ func newStreamHub() (*StreamHub, error) {
 
 // 為當前選中的螢幕初始化對應解析度的 H.264 編碼器
 func (h *StreamHub) initEncoderForCurrentMonitor() error {
-	if h.encoder != nil {
-		h.encoder.Close()
-		h.encoder = nil
-	}
 
 	m := h.monitors[h.currentMonitor]
 	fps := 30
@@ -201,6 +252,9 @@ func (h *StreamHub) initEncoderForCurrentMonitor() error {
 		return err
 	}
 
+	if h.encoder != nil {
+		h.encoder.Close()
+	}
 	h.encoder = enc
 	h.requestKeyNext = true
 	fmt.Printf("🎥 已為螢幕 %d (%dx%d) 啟用 H.264 即時編碼器\n", m.Index, m.Width, m.Height)
@@ -227,11 +281,18 @@ func (h *StreamHub) registerClient(c *Client) {
 
 // 發送初始化資訊給指定已驗證客戶端
 func (h *StreamHub) sendInitInfo(c *Client) {
+	h.mu.Lock()
+	role := c.role
+	name := c.name
+	h.mu.Unlock()
+	if c.conn != nil {
+		c.conn.SetReadLimit(10 * 1024 * 1024)
+	}
 	// 1. 發送授權成功通知與身分角色
 	c.safeSendJSON(map[string]interface{}{
 		"type":      "auth_success",
-		"role":      int(c.role),
-		"role_name": c.role.String(),
+		"role":      int(role),
+		"role_name": role.String(),
 	})
 
 	// 2. 獲取螢幕資訊並請求 IDR 關鍵幀 (獨立 h.mu，不與 c.mu 嵌套)
@@ -253,7 +314,7 @@ func (h *StreamHub) sendInitInfo(c *Client) {
 	c.safeSendJSON(map[string]interface{}{
 		"type":  "my_info",
 		"id":    c.id,
-		"name":  c.name,
+		"name":  name,
 		"color": c.color,
 	})
 
@@ -264,6 +325,8 @@ func (h *StreamHub) sendInitInfo(c *Client) {
 
 // 移除客戶端
 func (h *StreamHub) unregisterClient(c *Client) {
+	h.inputMu.Lock()
+	defer h.inputMu.Unlock()
 	h.mu.Lock()
 	if !h.clients[c] {
 		h.mu.Unlock()
@@ -271,18 +334,16 @@ func (h *StreamHub) unregisterClient(c *Client) {
 	}
 	delete(h.clients, c)
 	count := len(h.clients)
-	if h.currentController == c {
+	wasController := h.currentController == c
+	if wasController {
 		h.currentController = nil
 		h.controllerExpiry = time.Time{}
 	}
 	h.mu.Unlock()
 
-	c.closeOnce.Do(func() {
-		close(c.sendChan)
-		c.conn.Close()
-	})
+	c.close()
 
-	if h.inputCtrl != nil {
+	if wasController && h.inputCtrl != nil {
 		h.inputCtrl.ReleaseAllKeys()
 	}
 
@@ -296,6 +357,8 @@ func (h *StreamHub) unregisterClient(c *Client) {
 
 // 一鍵緊急踢除並斷開所有遠端客戶端
 func (h *StreamHub) kickAllClients() {
+	h.inputMu.Lock()
+	defer h.inputMu.Unlock()
 	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
@@ -307,10 +370,7 @@ func (h *StreamHub) kickAllClients() {
 	h.mu.Unlock()
 
 	for _, c := range clients {
-		c.closeOnce.Do(func() {
-			close(c.sendChan)
-			c.conn.Close()
-		})
+		c.reject()
 	}
 
 	if h.inputCtrl != nil {
@@ -324,16 +384,21 @@ func (h *StreamHub) kickAllClients() {
 
 // 嘗試獲取或續約控制權 (同一時間僅有一人能真正注入輸入)
 func (h *StreamHub) tryAcquireControl(c *Client) (bool, string) {
-	if c.role < auth.RoleStandard {
-		return false, "您目前僅有觀看權限，無法進行控制"
-	}
-
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if c.role < auth.RoleStandard || !h.validLocked(c) {
+		return false, "您目前無法進行控制"
+	}
+	if input.GetMasterOverride().IsOverridden() {
+		return false, "本機操作中"
+	}
 
 	now := time.Now()
 	// 若尚無主控者，或當前主控者租約已逾期
 	if h.currentController == nil || now.After(h.controllerExpiry) {
+		if h.inputCtrl != nil {
+			h.inputCtrl.ReleaseAllKeys()
+		}
 		h.currentController = c
 		h.controllerExpiry = now.Add(2 * time.Second)
 		go h.broadcastControlState()
@@ -349,6 +414,7 @@ func (h *StreamHub) tryAcquireControl(c *Client) (bool, string) {
 
 	// 若當前主控者為其他人，但自己是 RoleAdmin 而對方只是 RoleStandard，管理員可強制覆蓋接管
 	if c.role >= auth.RoleAdmin && h.currentController.role < auth.RoleAdmin {
+		h.inputCtrl.ReleaseAllKeys()
 		h.currentController = c
 		h.controllerExpiry = now.Add(2 * time.Second)
 		go h.broadcastControlState()
@@ -364,6 +430,7 @@ func (h *StreamHub) tryAcquireControl(c *Client) (bool, string) {
 func (h *StreamHub) releaseControl(c *Client) {
 	h.mu.Lock()
 	if h.currentController == c {
+		h.inputCtrl.ReleaseAllKeys()
 		h.currentController = nil
 		h.controllerExpiry = time.Time{}
 		h.mu.Unlock()
@@ -376,6 +443,7 @@ func (h *StreamHub) releaseControl(c *Client) {
 
 // 廣播協同雷射指針 (當未持有主控權的使用者滑動滑鼠時)
 func (h *StreamHub) broadcastLaser(sender *Client, x, y float64) {
+	h.mu.Lock()
 	msg := map[string]interface{}{
 		"type":  "laser_pointer",
 		"id":    sender.id,
@@ -385,17 +453,16 @@ func (h *StreamHub) broadcastLaser(sender *Client, x, y float64) {
 		"y":     y,
 	}
 
-	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if c.authed && c.role >= auth.RoleView && c != sender {
+		if h.validLocked(c) && c.role >= auth.RoleView && c != sender {
 			clients = append(clients, c)
 		}
 	}
 	h.mu.Unlock()
 
 	for _, c := range clients {
-		go c.safeSendJSON(msg)
+		c.safeSendJSON(msg)
 	}
 }
 
@@ -414,7 +481,7 @@ func (h *StreamHub) broadcastControlState() {
 	}
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if c.authed {
+		if h.validLocked(c) {
 			clients = append(clients, c)
 		}
 	}
@@ -427,10 +494,11 @@ func (h *StreamHub) broadcastControlState() {
 		"controller_name":  ctrlName,
 		"controller_color": ctrlColor,
 		"remain_ms":        remainMs,
+		"local_active":     input.GetMasterOverride().IsOverridden(),
 	}
 
 	for _, c := range clients {
-		go c.safeSendJSON(msg)
+		c.safeSendJSON(msg)
 	}
 }
 
@@ -451,7 +519,7 @@ func (h *StreamHub) broadcastMembersUpdate() {
 	var latestIP string
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if !c.authed {
+		if !h.validLocked(c) {
 			continue
 		}
 		clients = append(clients, c)
@@ -477,7 +545,7 @@ func (h *StreamHub) broadcastMembersUpdate() {
 	}
 
 	for _, c := range clients {
-		go c.safeSendJSON(msg)
+		c.safeSendJSON(msg)
 	}
 
 	// 同步更新原生 Win32 GUI 狀態文字
@@ -488,8 +556,11 @@ func (h *StreamHub) broadcastMembersUpdate() {
 
 // 切換觀看的目標螢幕
 func (h *StreamHub) switchMonitor(targetIdx int) {
+	h.streamMu.Lock()
+	defer h.streamMu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	defer func() { go h.broadcastInit() }()
 
 	if targetIdx < 0 || targetIdx >= len(h.monitors) {
 		return
@@ -498,8 +569,10 @@ func (h *StreamHub) switchMonitor(targetIdx int) {
 		return
 	}
 
+	previous := h.currentMonitor
 	h.currentMonitor = targetIdx
 	if err := h.initEncoderForCurrentMonitor(); err != nil {
+		h.currentMonitor = previous
 		fmt.Printf("❌ 切換螢幕編碼器失敗: %v\n", err)
 	}
 }
@@ -518,20 +591,18 @@ func (h *StreamHub) broadcast(data []byte) {
 	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if c.authed && c.role >= auth.RoleView {
+		if h.validLocked(c) && c.role >= auth.RoleView {
 			clients = append(clients, c)
 		}
 	}
 	h.mu.Unlock()
 
-	// 零鎖非阻塞派發至各客戶端的專屬緩衝通道
 	for _, c := range clients {
-		select {
-		case c.sendChan <- data:
-		default:
-			// 隊列滿代表該客戶端當前網路延遲/擁塞，自動丟棄過期舊幀防積壓，絕不拖累伺服器與其他人！
+		if c.enqueueFrame(data) {
+			h.requestKeyframe()
 		}
 	}
+
 }
 
 // 廣播剪貼簿純文字給具備一般控制 (RoleStandard) 以上之客戶端
@@ -543,14 +614,14 @@ func (h *StreamHub) broadcastClipboard(text string) {
 	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if c.authed && c.role >= auth.RoleStandard {
+		if h.clipboardAllowedLocked(c) {
 			clients = append(clients, c)
 		}
 	}
 	h.mu.Unlock()
 
 	for _, c := range clients {
-		go c.safeSendJSON(msg)
+		c.safeSendJSON(msg)
 	}
 }
 
@@ -564,14 +635,14 @@ func (h *StreamHub) broadcastClipboardImage(pngBytes []byte) {
 	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if c.authed && c.role >= auth.RoleStandard {
+		if h.clipboardAllowedLocked(c) {
 			clients = append(clients, c)
 		}
 	}
 	h.mu.Unlock()
 
 	for _, c := range clients {
-		go c.safeSendJSON(msg)
+		c.safeSendJSON(msg)
 	}
 }
 
@@ -583,26 +654,41 @@ func (h *StreamHub) startStreamingLoop() {
 	var startTime = time.Now()
 
 	for range ticker.C {
+		h.streamMu.Lock()
 		// 只有在至少有一個客戶端連線時才抓取並壓縮，完全零無效負載！
 		h.mu.Lock()
-		clientCount := len(h.clients)
+		clientCount := 0
+		for c := range h.clients {
+			if h.validLocked(c) {
+				clientCount++
+			}
+		}
 		curMon := h.currentMonitor
 		enc := h.encoder
 		h.mu.Unlock()
 
 		if clientCount == 0 || enc == nil {
+			h.streamMu.Unlock()
 			continue
 		}
 
 		// 1. 擷取畫面
 		frame, err := h.capEngine.CaptureFrame(curMon)
 		if err != nil || frame == nil {
+			h.streamMu.Unlock()
+			if err != nil {
+				h.recoverCapture()
+			}
 			continue
 		}
 
 		// 2. H.264 即時編碼
 		nalu, isKey, err := enc.Encode(frame.Data)
+		h.streamMu.Unlock()
 		if err != nil || len(nalu) == 0 {
+			if err != nil {
+				h.recoverCapture()
+			}
 			continue
 		}
 
@@ -638,11 +724,14 @@ func main() {
 	}()
 
 	var port int
+	var flagPwd string
+	bindIP := flag.String("bind", "", "監聽 IP（預設所有網卡；可設 127.0.0.1）")
 	modeHTTPS := flag.Bool("https", false, "啟用記憶體自簽 HTTPS 模式 (預設為純 HTTP 模式)")
 	flag.IntVar(&port, "port", 8080, "服務監聽埠號 (支援 --port 或 -port)")
 	flag.IntVar(&port, "p", 8080, "服務監聽埠號簡寫 (支援 -p 或 --p)")
+	flag.StringVar(&flagPwd, "pwd", "", "自訂全權限存取密碼 (支援英文字母、數字與特殊符號)")
 	flag.Parse()
-	addr := fmt.Sprintf(":%d", port)
+	addr := net.JoinHostPort(*bindIP, fmt.Sprint(port))
 
 	// 0. 外部依賴檢查：Windows Media Foundation (mfplat.dll / mfreadwrite.dll)
 	if err := encoder.CheckMediaFoundationAvailable(); err != nil {
@@ -661,6 +750,9 @@ func main() {
 	testLn.Close()
 
 	ips := getLocalIPs()
+	if *bindIP != "" {
+		ips = []string{*bindIP}
+	}
 	primaryIP := "localhost"
 	if len(ips) > 0 {
 		primaryIP = ips[len(ips)-1]
@@ -688,12 +780,40 @@ func main() {
 			hostGUI.ShowAuthPrompt(req)
 		}
 	})
+
+	// 載入本地設定檔 (config.json) 中的自訂密碼
+	appCfg := config.LoadConfig()
+	if appCfg.LoadError != nil {
+		gui.ShowFatalError("設定檔錯誤", "%v", appCfg.LoadError)
+		return
+	}
+	if flagPwd != "" {
+		// 若透過命令列指定，直接套用全權限密碼
+		if err := authMgr.SetPassword(auth.RoleAdmin, flagPwd); err != nil {
+			gui.ShowFatalError("密碼設定失敗", "%v", err)
+			return
+		}
+	} else if appCfg.RememberPasswords && appCfg.Loaded {
+		// 載入已儲存之自訂密碼 (支援英數字及各類特殊符號)
+		if err := authMgr.ApplyPasswords(appCfg.ViewPassword, appCfg.StandardPassword, appCfg.AdminPassword); err != nil {
+			gui.ShowFatalError("密碼設定失敗", "%v", err)
+			return
+		}
+	}
 	hub.authMgr = authMgr
 
 	// 3. 啟動被控端純 Win32 原生管理 GUI (零體積膨脹，AnyDesk 原生質感)
-	hostGUI = gui.StartHostGUI(authMgr, serverURL, func() {
+	serverURLs := []string{serverURL}
+	for _, ip := range ips {
+		url := fmt.Sprintf("%s://%s:%d", serverProtocol, ip, port)
+		if url != serverURL {
+			serverURLs = append(serverURLs, url)
+		}
+	}
+	serverURLs = append(serverURLs, fmt.Sprintf("%s://localhost:%d", serverProtocol, port))
+	hostGUI = gui.StartHostGUI(authMgr, serverURLs, func() {
 		hub.kickAllClients()
-	})
+	}, func() { go hub.recoverCapture() })
 	hub.hostGUI = hostGUI
 
 	// 啟動背景推流工作協程
@@ -707,6 +827,11 @@ func main() {
 		func(imgBytes []byte) {
 			hub.broadcastClipboardImage(imgBytes)
 		},
+		func() bool {
+			hub.mu.Lock()
+			defer hub.mu.Unlock()
+			return hub.currentController != nil && hub.clipboardAllowedLocked(hub.currentController)
+		},
 	)
 
 	// 4. 配置內嵌靜態資源 HTTP 路由
@@ -718,243 +843,17 @@ func main() {
 	http.Handle("/", http.FileServer(http.FS(webSubFS)))
 
 	// 認證 API 1: 密碼登入驗證端點 (根據不同密碼自動核發不同等級 Role 與 Token)
-	http.HandleFunc("/api/auth/login", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var req struct {
-			Password string `json:"password"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if clientIP == "" {
-			clientIP = r.RemoteAddr
-		}
-		role, token, ok := authMgr.AuthenticateByPassword(req.Password, clientIP)
-		if !ok {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"error": "密碼錯誤，請檢查後重新輸入",
-			})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":    "ok",
-			"token":     token,
-			"role":      int(role),
-			"role_name": role.String(),
-		})
-	})
-
+	http.HandleFunc("/api/auth/login", hub.handleLogin)
 	// 認證 API 2: 請求被控端許可核准端點 (遠端在沒有密碼時點擊「發送連線請求」)
-	http.HandleFunc("/api/auth/request", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if clientIP == "" {
-			clientIP = r.RemoteAddr
-		}
-		authReq := authMgr.CreateRequest(clientIP)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":     "pending",
-			"request_id": authReq.ID,
-		})
-	})
-
+	http.HandleFunc("/api/auth/request", hub.handleAuthRequest)
 	// 認證 API 3: 輪詢被控端審核狀態端點
-	http.HandleFunc("/api/auth/status", func(w http.ResponseWriter, r *http.Request) {
-		reqID := r.URL.Query().Get("id")
-		if reqID == "" {
-			http.Error(w, "Missing id", http.StatusBadRequest)
-			return
-		}
-		authReq, exists := authMgr.GetRequestStatus(reqID)
-		if !exists {
-			http.Error(w, "Not Found", http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":       int(authReq.Status),
-			"granted_role": int(authReq.GrantedRole),
-			"role_name":    authReq.GrantedRole.String(),
-			"token":        authReq.Token,
-		})
-	})
-
+	http.HandleFunc("/api/auth/status", hub.handleAuthStatus)
 	// 檔案拖曳上傳端點 (需具備 RoleStandard 以上權限)
 	// 具備防中斷、防丟包之原子寫入機制，避免殘留損壞檔案
-	http.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// 權限校驗：必須具備一般控制 (RoleStandard) 以上
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			token = r.Header.Get("X-Auth-Token")
-		}
-		role, ok := authMgr.ValidateToken(token)
-		if !ok || role < auth.RoleStandard {
-			http.Error(w, "未具備檔案傳輸權限 (需一般控制或完全控制)", http.StatusForbidden)
-			return
-		}
-
-		r.Body = http.MaxBytesReader(w, r.Body, 1024*1024*1024) // 單次最高支援 1GB
-		reader, err := r.MultipartReader()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		homeDir, _ := os.UserHomeDir()
-		desktopDir := filepath.Join(homeDir, "Desktop")
-		if _, err := os.Stat(desktopDir); os.IsNotExist(err) {
-			desktopDir = homeDir
-		}
-
-		var savedPaths []string
-
-		for {
-			part, err := reader.NextPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				break
-			}
-
-			fileName := part.FileName()
-			if fileName == "" {
-				continue
-			}
-
-			destPath := filepath.Join(desktopDir, fileName)
-			// 防同名覆蓋
-			ext := filepath.Ext(fileName)
-			nameOnly := fileName[:len(fileName)-len(ext)]
-			counter := 1
-			for {
-				if _, err := os.Stat(destPath); os.IsNotExist(err) {
-					break
-				}
-				destPath = filepath.Join(desktopDir, fmt.Sprintf("%s (%d)%s", nameOnly, counter, ext))
-				counter++
-			}
-
-			// 寫入臨時檔案以防傳輸中斷導致檔案破損
-			tempPath := destPath + ".tmp_uploading"
-			tempFile, err := os.Create(tempPath)
-			if err != nil {
-				continue
-			}
-
-			_, copyErr := io.Copy(tempFile, part)
-			tempFile.Close()
-
-			if copyErr != nil {
-				os.Remove(tempPath)
-				continue
-			}
-
-			// 傳輸完整成功後，原子替換為正式檔名
-			if err := os.Rename(tempPath, destPath); err != nil {
-				os.Remove(tempPath)
-				continue
-			}
-
-			savedPaths = append(savedPaths, destPath)
-			// 同時將檔案路徑注入 Windows 剪貼簿 (CF_HDROP)
-			clipboard.WriteFileDrop(destPath)
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "ok",
-			"files":  savedPaths,
-		})
-	})
+	http.HandleFunc("/upload", hub.handleUpload)
 
 	// 5. 配置 WebSocket 連線端點 (具備身分權限驗證與 Ping/Pong 心跳保活)
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-
-		token := r.URL.Query().Get("token")
-		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		if clientIP == "" {
-			clientIP = r.RemoteAddr
-		}
-
-		seq := atomic.AddUint64(&clientSeq, 1)
-		color := userColors[(seq-1)%uint64(len(userColors))]
-		clientID := fmt.Sprintf("C%d", seq)
-		shortIP := clientIP
-		if len(shortIP) > 15 {
-			shortIP = shortIP[:15]
-		}
-		defaultName := fmt.Sprintf("成員-%d (%s)", seq, shortIP)
-
-		client := &Client{
-			conn:      conn,
-			id:        clientID,
-			name:      defaultName,
-			color:     color,
-			ip:        clientIP,
-			token:     token,
-			role:      auth.RoleNone,
-			authed:    false,
-			connected: time.Now(),
-			sendChan:  make(chan []byte, 10),
-		}
-
-		// 若已自帶合法 Token 則直接賦權
-		if token != "" {
-			if role, valid := authMgr.ValidateToken(token); valid {
-				client.role = role
-				client.authed = true
-			}
-		}
-
-		hub.registerClient(client)
-
-		// 啟動專屬非阻塞寫入與 Ping 心跳協程
-		go client.writePump(hub)
-
-		// 設定初始讀取逾時與 Pong 回應處理
-		conn.SetReadLimit(10 * 1024 * 1024)
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		conn.SetPongHandler(func(string) error {
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			return nil
-		})
-
-		// 監聽客戶端上行控制指令
-		for {
-			_, msgBytes, err := conn.ReadMessage()
-			if err != nil {
-				hub.unregisterClient(client)
-				break
-			}
-
-			// 客戶端傳送任何指令時刷新讀取超時
-			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			hub.handleClientCommand(client, msgBytes)
-		}
-	})
-
+	http.HandleFunc("/ws", hub.handleWebSocket)
 	if *modeHTTPS {
 		// HTTPS 模式
 		cert, err := generateMemoryCertificate()
@@ -964,9 +863,9 @@ func main() {
 		}
 
 		server := &http.Server{
-			Addr: addr,
+			Addr: addr, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, Handler: secureHandler(http.DefaultServeMux),
 			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
+				Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12,
 			},
 		}
 
@@ -990,7 +889,7 @@ func main() {
 		fmt.Println("✨ 免裝憑證、免開 HTTPS、開箱即用！")
 		fmt.Println("\n按下 Ctrl+C 可停止服務。")
 
-		if err := http.ListenAndServe(addr, nil); err != nil && err != http.ErrServerClosed {
+		if err := (&http.Server{Addr: addr, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, Handler: secureHandler(http.DefaultServeMux)}).ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			gui.ShowFatalError("NanoDesk - HTTP 服務異常中止", "HTTP 伺服器監聽發生錯誤：%v", err)
 		}
 	}
@@ -1068,6 +967,16 @@ func generateMemoryCertificate() (tls.Certificate, error) {
 
 // 處理客戶端傳遞的鍵鼠與控制指令 (嚴格遵循三級權限模型)
 func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
+	h.inputMu.Lock()
+	defer h.inputMu.Unlock()
+	h.mu.Lock()
+	role, authed := client.role, client.authed
+	valid := h.validLocked(client)
+	h.mu.Unlock()
+	if authed && !valid {
+		client.reject()
+		return
+	}
 	var cmd map[string]interface{}
 	if err := json.Unmarshal(msgBytes, &cmd); err != nil {
 		return
@@ -1076,16 +985,16 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 	cmdType, _ := cmd["type"].(string)
 
 	// 1. 若客戶端尚未通過身分驗證，僅開放登入或 Token 驗證指令
-	if !client.authed {
+	if !authed {
 		switch cmdType {
 		case "auth_token":
 			if token, ok := cmd["token"].(string); ok && token != "" {
 				if role, valid := h.authMgr.ValidateToken(token); valid {
-					client.mu.Lock()
+					h.mu.Lock()
 					client.token = token
 					client.role = role
 					client.authed = true
-					client.mu.Unlock()
+					h.mu.Unlock()
 					h.sendInitInfo(client)
 					return
 				}
@@ -1093,13 +1002,13 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 			client.safeSendJSON(map[string]interface{}{"type": "auth_fail", "message": "Token 無效或已過期"})
 
 		case "auth_login":
-			if pwd, ok := cmd["password"].(string); ok {
+			if pwd, ok := cmd["password"].(string); ok && len([]rune(pwd)) <= 64 {
 				if role, token, valid := h.authMgr.AuthenticateByPassword(pwd, client.ip); valid {
-					client.mu.Lock()
+					h.mu.Lock()
 					client.token = token
 					client.role = role
 					client.authed = true
-					client.mu.Unlock()
+					h.mu.Unlock()
 					h.sendInitInfo(client)
 					return
 				}
@@ -1112,20 +1021,23 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 	// 2. 根據客戶端當前授權之角色 (Role) 實施嚴格功能過濾與多人租約仲裁
 	switch cmdType {
 	case "mouse_move":
-		if client.role < auth.RoleStandard {
+		if role < auth.RoleStandard {
 			return // 僅觀看者禁止滑鼠移動
 		}
 		x, okX := cmd["x"].(float64)
 		y, okY := cmd["y"].(float64)
 		if okX && okY {
 			// 檢查是否取得/持有主控權
-			acquired, _ := h.tryAcquireControl(client)
+			acquired, reason := h.tryAcquireControl(client)
+			if reason == "本機操作中" {
+				return
+			}
 			if acquired {
 				// 持有主控權：真正注入 Windows 滑鼠座標
 				h.mu.Lock()
 				mon := h.monitors[h.currentMonitor]
 				h.mu.Unlock()
-				h.inputCtrl.MoveMouseAbsolute(mon.X, mon.Y, mon.Width, mon.Height, x, y)
+				h.reportInputError(client, h.inputCtrl.MoveMouseAbsolute(mon.X, mon.Y, mon.Width, mon.Height, x, y))
 			} else {
 				// 未持有主控權：轉為協同彩色雷射筆指針廣播，不擾動作業系統游標
 				h.broadcastLaser(client, x, y)
@@ -1133,7 +1045,7 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		}
 
 	case "mouse_button":
-		if client.role < auth.RoleStandard {
+		if role < auth.RoleStandard {
 			return // 僅觀看者禁止滑鼠點擊
 		}
 		acquired, reason := h.tryAcquireControl(client)
@@ -1144,11 +1056,11 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		btn, okB := cmd["button"].(float64)
 		isDown, okD := cmd["isDown"].(bool)
 		if okB && okD {
-			h.inputCtrl.MouseButton(int(btn), isDown)
+			h.reportInputError(client, h.inputCtrl.MouseButton(int(btn), isDown))
 		}
 
 	case "mouse_wheel":
-		if client.role < auth.RoleStandard {
+		if role < auth.RoleStandard {
 			return // 僅觀看者禁止滾輪
 		}
 		acquired, reason := h.tryAcquireControl(client)
@@ -1158,10 +1070,10 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		}
 		dx, _ := cmd["deltaX"].(float64)
 		dy, _ := cmd["deltaY"].(float64)
-		h.inputCtrl.MouseWheel(int(dx), int(dy))
+		h.reportInputError(client, h.inputCtrl.MouseWheel(int(dx), int(dy)))
 
 	case "key":
-		if client.role < auth.RoleStandard {
+		if role < auth.RoleStandard {
 			return // 僅觀看者禁止鍵盤輸入
 		}
 		acquired, reason := h.tryAcquireControl(client)
@@ -1173,12 +1085,15 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		isDown, okD := cmd["isDown"].(bool)
 		if okC && okD {
 			if vk, exists := input.CodeToVK(code); exists {
-				h.inputCtrl.SendKey(vk, isDown)
+				if role < auth.RoleAdmin && h.inputCtrl.BlockedStandardKey(vk, isDown) {
+					return
+				}
+				h.reportInputError(client, h.inputCtrl.SendKey(vk, isDown))
 			}
 		}
 
 	case "release_all_keys":
-		if client.role >= auth.RoleStandard {
+		if role >= auth.RoleStandard && h.isController(client) {
 			h.inputCtrl.ReleaseAllKeys()
 		}
 
@@ -1196,16 +1111,28 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 	case "rename":
 		// 成員自訂暱稱
 		if name, ok := cmd["name"].(string); ok && name != "" {
-			if len(name) > 20 {
-				name = name[:20]
+			if len([]rune(name)) > 20 {
+				name = string([]rune(name)[:20])
 			}
+			h.mu.Lock()
 			client.name = name
+			h.mu.Unlock()
 			go h.broadcastMembersUpdate()
 			go h.broadcastControlState()
 		}
 
+	case "clipboard_auto":
+		if enabled, ok := cmd["enabled"].(bool); ok {
+			h.mu.Lock()
+			client.clipboardEnabled = enabled
+			h.mu.Unlock()
+		}
+		return
 	case "clipboard_sync":
-		if client.role < auth.RoleStandard {
+		if !h.clipboardAllowed(client) {
+			return
+		}
+		if role < auth.RoleStandard {
 			return // 僅觀看者禁止寫入剪貼簿
 		}
 		if txt, ok := cmd["text"].(string); ok && txt != "" {
@@ -1216,7 +1143,7 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		}
 
 	case "clipboard_paste":
-		if client.role < auth.RoleStandard {
+		if role < auth.RoleStandard {
 			return
 		}
 		acquired, reason := h.tryAcquireControl(client)
@@ -1225,18 +1152,24 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 			return
 		}
 		if txt, ok := cmd["text"].(string); ok && txt != "" {
-			clipboard.WriteText(txt)
+			if err := clipboard.WriteText(txt); err != nil {
+				client.safeSendJSON(map[string]interface{}{"type": "operation_error", "message": err.Error()})
+				return
+			}
 			// 保證 Windows 剪貼簿寫入完成 (25ms)，緊接著精確觸發一次 Ctrl+V 貼上
 			time.Sleep(25 * time.Millisecond)
-			h.inputCtrl.SendKey(0x11, true)  // VK_CONTROL
-			h.inputCtrl.SendKey(0x56, true)  // VK_V
+			h.inputCtrl.SendKey(0x11, true) // VK_CONTROL
+			h.inputCtrl.SendKey(0x56, true) // VK_V
 			time.Sleep(10 * time.Millisecond)
 			h.inputCtrl.SendKey(0x56, false)
 			h.inputCtrl.SendKey(0x11, false)
 		}
 
 	case "clipboard_image_paste", "clipboard_image_upload":
-		if client.role < auth.RoleStandard {
+		if cmdType == "clipboard_image_upload" && !h.clipboardAllowed(client) {
+			return
+		}
+		if role < auth.RoleStandard {
 			return // 僅觀看者禁止上傳截圖
 		}
 		acquired, reason := h.tryAcquireControl(client)
@@ -1246,12 +1179,15 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		}
 		if b64, ok := cmd["data"].(string); ok && b64 != "" {
 			if imgBytes, err := base64.StdEncoding.DecodeString(b64); err == nil {
-				clipboard.WriteImagePNG(imgBytes)
+				if err := clipboard.WriteImagePNG(imgBytes); err != nil {
+					client.safeSendJSON(map[string]interface{}{"type": "operation_error", "message": err.Error()})
+					return
+				}
 				// 若為使用者按 Ctrl+V 的主動貼上請求，觸發一次 Ctrl+V 貼上
 				if cmdType == "clipboard_image_paste" {
 					time.Sleep(30 * time.Millisecond)
-					h.inputCtrl.SendKey(0x11, true)  // VK_CONTROL
-					h.inputCtrl.SendKey(0x56, true)  // VK_V
+					h.inputCtrl.SendKey(0x11, true) // VK_CONTROL
+					h.inputCtrl.SendKey(0x56, true) // VK_V
 					time.Sleep(10 * time.Millisecond)
 					h.inputCtrl.SendKey(0x56, false)
 					h.inputCtrl.SendKey(0x11, false)
@@ -1260,6 +1196,9 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		}
 
 	case "clipboard_get":
+		if !h.clipboardAllowed(client) {
+			return
+		}
 		txt, _ := clipboard.ReadText()
 		client.safeSendJSON(map[string]interface{}{
 			"type": "clipboard_data",
@@ -1267,7 +1206,10 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		})
 
 	case "clipboard_set":
-		if client.role < auth.RoleStandard {
+		if !h.isController(client) {
+			return
+		}
+		if role < auth.RoleStandard {
 			return
 		}
 		if txt, ok := cmd["text"].(string); ok {
@@ -1275,7 +1217,7 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 		}
 
 	case "type_text":
-		if client.role < auth.RoleStandard {
+		if role < auth.RoleStandard {
 			return
 		}
 		acquired, reason := h.tryAcquireControl(client)
@@ -1284,18 +1226,25 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 			return
 		}
 		if txt, ok := cmd["text"].(string); ok {
-			h.inputCtrl.TypeText(txt)
+			if len(txt) > 65536 {
+				h.reportInputError(client, fmt.Errorf("單次文字輸入最多 64 KiB"))
+				return
+			}
+			h.reportInputError(client, h.inputCtrl.TypeText(txt))
 		}
 
 	case "special_key":
 		keyName, _ := cmd["key"].(string)
 		// 特權組合鍵 (Ctrl+Alt+Del, 工作管理員) 僅限完全控制(RoleAdmin)
-		if keyName == "ctrl_alt_del" || keyName == "ctrl_shift_esc" {
-			if client.role < auth.RoleAdmin {
+		if keyName == "ctrl_alt_del" {
+			return
+		}
+		if keyName == "ctrl_shift_esc" {
+			if role < auth.RoleAdmin {
 				return // 攔截非管理員使用特權鍵
 			}
 		} else {
-			if client.role < auth.RoleStandard {
+			if role < auth.RoleStandard {
 				return
 			}
 		}
@@ -1304,9 +1253,12 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 			client.safeSendJSON(map[string]interface{}{"type": "control_denied", "message": reason})
 			return
 		}
-		h.handleSpecialKey(keyName)
+		h.handleSpecialKey(client, keyName)
 
 	case "switch_monitor":
+		if acquired, _ := h.tryAcquireControl(client); !acquired {
+			return
+		}
 		if targetIdx, ok := cmd["index"].(float64); ok {
 			h.switchMonitor(int(targetIdx))
 		}
@@ -1317,48 +1269,39 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 }
 
 // 處理系統組合快捷鍵
-func (h *StreamHub) handleSpecialKey(keyName string) {
+func (h *StreamHub) handleSpecialKey(client *Client, keyName string) {
 	switch keyName {
 	case "win":
 		// 按下並放開 Win 鍵 (開啟開始功能表)
-		h.inputCtrl.SendKey(0x5B, true)
+		h.reportInputError(client, h.inputCtrl.SendKey(0x5B, true))
 		time.Sleep(20 * time.Millisecond)
-		h.inputCtrl.SendKey(0x5B, false)
+		h.reportInputError(client, h.inputCtrl.SendKey(0x5B, false))
 
 	case "win_d":
 		// Win + D (顯示/隱藏桌面)
-		h.inputCtrl.SendKey(0x5B, true)
-		h.inputCtrl.SendKey(0x44, true)
+		h.reportInputError(client, h.inputCtrl.SendKey(0x5B, true))
+		h.reportInputError(client, h.inputCtrl.SendKey(0x44, true))
 		time.Sleep(20 * time.Millisecond)
-		h.inputCtrl.SendKey(0x44, false)
-		h.inputCtrl.SendKey(0x5B, false)
+		h.reportInputError(client, h.inputCtrl.SendKey(0x44, false))
+		h.reportInputError(client, h.inputCtrl.SendKey(0x5B, false))
 
 	case "alt_tab":
 		// Alt + Tab (快速切換視窗)
-		h.inputCtrl.SendKey(0x12, true)
-		h.inputCtrl.SendKey(0x09, true)
+		h.reportInputError(client, h.inputCtrl.SendKey(0x12, true))
+		h.reportInputError(client, h.inputCtrl.SendKey(0x09, true))
 		time.Sleep(30 * time.Millisecond)
-		h.inputCtrl.SendKey(0x09, false)
-		h.inputCtrl.SendKey(0x12, false)
+		h.reportInputError(client, h.inputCtrl.SendKey(0x09, false))
+		h.reportInputError(client, h.inputCtrl.SendKey(0x12, false))
 
 	case "ctrl_shift_esc":
 		// Ctrl + Shift + Esc (直接啟動工作管理員)
-		h.inputCtrl.SendKey(0x11, true) // Ctrl
-		h.inputCtrl.SendKey(0x10, true) // Shift
-		h.inputCtrl.SendKey(0x1B, true) // Esc
+		h.reportInputError(client, h.inputCtrl.SendKey(0x11, true)) // Ctrl
+		h.reportInputError(client, h.inputCtrl.SendKey(0x10, true)) // Shift
+		h.reportInputError(client, h.inputCtrl.SendKey(0x1B, true)) // Esc
 		time.Sleep(30 * time.Millisecond)
-		h.inputCtrl.SendKey(0x1B, false)
-		h.inputCtrl.SendKey(0x10, false)
-		h.inputCtrl.SendKey(0x11, false)
+		h.reportInputError(client, h.inputCtrl.SendKey(0x1B, false))
+		h.reportInputError(client, h.inputCtrl.SendKey(0x10, false))
+		h.reportInputError(client, h.inputCtrl.SendKey(0x11, false))
 
-	case "ctrl_alt_del":
-		// 優先透過工作管理員快捷鍵喚醒系統層
-		h.inputCtrl.SendKey(0x11, true)
-		h.inputCtrl.SendKey(0x10, true)
-		h.inputCtrl.SendKey(0x1B, true)
-		time.Sleep(30 * time.Millisecond)
-		h.inputCtrl.SendKey(0x1B, false)
-		h.inputCtrl.SendKey(0x10, false)
-		h.inputCtrl.SendKey(0x11, false)
 	}
 }

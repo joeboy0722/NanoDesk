@@ -890,3 +890,13 @@ select:hover {
     font-size: 11px;
     margin-left: 4px;
 }
+
+/* Keep controls usable on narrow windows without adding a UI framework. */
+#topBar { height:auto; min-height:44px; flex-wrap:wrap; gap:8px; padding:8px 12px; }
+.left-group,.center-group,.right-group { flex-wrap:wrap; }
+#viewport { min-height:0; }
+#screenCanvas,#screenVideo { flex-shrink:0; }
+#clipboardAuto { margin-right:4px; }
+@media(max-width:800px){#topBar{font-size:12px}.status-indicator{max-width:260px}.center-group{gap:4px}.right-group{gap:6px}}
+
+.btn.hidden { display:none; }

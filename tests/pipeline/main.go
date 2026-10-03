@@ -12,7 +12,8 @@ import (
 func main() {
 	fmt.Println("======================================================")
 	fmt.Println("   Web KVM 畫面擷取 -> H.264 視訊編碼管線驗證")
-	fmt.Println("======================================================\n")
+	fmt.Println("======================================================")
+	fmt.Println()
 
 	// 1. 初始化畫面擷取引擎
 	var capEngine capture.Capturer = capture.NewDXGICapturer()

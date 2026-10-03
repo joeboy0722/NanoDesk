@@ -7,10 +7,13 @@ import (
 	"image"
 	"image/draw"
 	"image/png"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 )
+
+var clipboardMu sync.Mutex
 
 var (
 	user32   = syscall.NewLazyDLL("user32.dll")
@@ -28,6 +31,7 @@ var (
 	procGlobalLock   = kernel32.NewProc("GlobalLock")
 	procGlobalUnlock = kernel32.NewProc("GlobalUnlock")
 	procGlobalSize   = kernel32.NewProc("GlobalSize")
+	procGlobalFree   = kernel32.NewProc("GlobalFree")
 )
 
 const (
@@ -62,6 +66,8 @@ type dropFiles struct {
 
 // ReadText 讀取 Windows 系統剪貼簿中的純文字
 func ReadText() (string, error) {
+	clipboardMu.Lock()
+	defer clipboardMu.Unlock()
 	avail, _, _ := procIsClipboardFormatAvailable.Call(uintptr(CF_UNICODETEXT))
 	if avail == 0 {
 		return "", nil
@@ -84,21 +90,24 @@ func ReadText() (string, error) {
 	}
 	defer procGlobalUnlock.Call(hData)
 
-	u16Ptr := (*uint16)(unsafe.Pointer(pData))
-	var u16Slice []uint16
-	for i := 0; ; i++ {
-		val := *(*uint16)(unsafe.Pointer(uintptr(unsafe.Pointer(u16Ptr)) + uintptr(i*2)))
-		if val == 0 {
-			break
-		}
-		u16Slice = append(u16Slice, val)
+	size, _, _ := procGlobalSize.Call(hData)
+	if size < 2 || size > 2*1024*1024 {
+		return "", fmt.Errorf("剪貼簿文字過大或損壞")
 	}
+	data := unsafe.Slice((*uint16)(unsafe.Pointer(pData)), int(size/2))
+	for i, ch := range data {
+		if ch == 0 {
+			return syscall.UTF16ToString(data[:i]), nil
+		}
+	}
+	return "", fmt.Errorf("剪貼簿文字沒有結尾")
 
-	return syscall.UTF16ToString(u16Slice), nil
 }
 
 // WriteText 將指定字串寫入 Windows 系統剪貼簿
 func WriteText(text string) error {
+	clipboardMu.Lock()
+	defer clipboardMu.Unlock()
 	utf16, err := syscall.UTF16FromString(text)
 	if err != nil {
 		return err
@@ -111,6 +120,12 @@ func WriteText(text string) error {
 		return fmt.Errorf("分配全域記憶體失敗: %v", errAlloc)
 	}
 
+	owned := true
+	defer func() {
+		if owned {
+			procGlobalFree.Call(hMem)
+		}
+	}()
 	pMem, _, errLock := procGlobalLock.Call(hMem)
 	if pMem == 0 {
 		return fmt.Errorf("鎖定全域記憶體失敗: %v", errLock)
@@ -135,11 +150,21 @@ func WriteText(text string) error {
 		return fmt.Errorf("設定剪貼簿資料失敗: %v", errSet)
 	}
 
+	owned = false
 	return nil
 }
 
 // WriteImagePNG 將 PNG 格式圖片解碼並寫入 Windows 系統剪貼簿 (CF_DIB 格式)
 func WriteImagePNG(pngData []byte) error {
+	clipboardMu.Lock()
+	defer clipboardMu.Unlock()
+	if len(pngData) > 7*1024*1024 {
+		return fmt.Errorf("PNG 超過 7 MiB")
+	}
+	cfg, err := png.DecodeConfig(bytes.NewReader(pngData))
+	if err != nil || !validImageSize(cfg.Width, cfg.Height) {
+		return fmt.Errorf("不合法或過大的 PNG")
+	}
 	img, err := png.Decode(bytes.NewReader(pngData))
 	if err != nil {
 		return fmt.Errorf("解析 PNG 圖片失敗: %v", err)
@@ -165,6 +190,12 @@ func WriteImagePNG(pngData []byte) error {
 		return fmt.Errorf("分配 DIB 記憶體失敗: %v", errAlloc)
 	}
 
+	owned := true
+	defer func() {
+		if owned {
+			procGlobalFree.Call(hMem)
+		}
+	}()
 	pMem, _, errLock := procGlobalLock.Call(hMem)
 	if pMem == 0 {
 		return fmt.Errorf("鎖定 DIB 記憶體失敗: %v", errLock)
@@ -181,16 +212,16 @@ func WriteImagePNG(pngData []byte) error {
 	header.BiSizeImage = uint32(imageSize)
 
 	// 填寫像素資料 (由底行向上寫入，RGBA 轉 BGR)
-	pixelBase := uintptr(unsafe.Pointer(pMem)) + uintptr(headerSize)
+	pixels := unsafe.Slice((*byte)(unsafe.Pointer(pMem)), totalSize)[headerSize:]
 	for y := 0; y < h; y++ {
 		srcY := h - 1 - y // Bottom-Up 倒轉
-		dstRow := pixelBase + uintptr(y*rowPitch)
+		dstRow := pixels[y*rowPitch : (y+1)*rowPitch]
 		for x := 0; x < w; x++ {
 			c := rgba.RGBAAt(x, srcY)
-			dstPixel := dstRow + uintptr(x*3)
-			*(*byte)(unsafe.Pointer(dstPixel)) = c.B
-			*(*byte)(unsafe.Pointer(dstPixel + 1)) = c.G
-			*(*byte)(unsafe.Pointer(dstPixel + 2)) = c.R
+			dstPixel := dstRow[x*3 : x*3+3]
+			dstPixel[0] = c.B
+			dstPixel[1] = c.G
+			dstPixel[2] = c.R
 		}
 	}
 
@@ -209,11 +240,14 @@ func WriteImagePNG(pngData []byte) error {
 		return fmt.Errorf("設定 CF_DIB 剪貼簿失敗: %v", errSet)
 	}
 
+	owned = false
 	return nil
 }
 
 // ReadImagePNG 讀取 Windows 系統剪貼簿中的 DIB 圖片，並轉為 PNG 位元組流
 func ReadImagePNG() ([]byte, error) {
+	clipboardMu.Lock()
+	defer clipboardMu.Unlock()
 	avail, _, _ := procIsClipboardFormatAvailable.Call(uintptr(CF_DIB))
 	if avail == 0 {
 		return nil, nil // 當前無圖片
@@ -236,72 +270,71 @@ func ReadImagePNG() ([]byte, error) {
 	}
 	defer procGlobalUnlock.Call(hData)
 
-	header := (*bitmapInfoHeader)(unsafe.Pointer(pData))
-	if header.BiSize < 40 {
-		return nil, fmt.Errorf("不支援的 DIB Header 格式: %d", header.BiSize)
+	size, _, _ := procGlobalSize.Call(hData)
+	if size < 40 || size > 128*1024*1024 {
+		return nil, fmt.Errorf("不合法的 DIB 大小")
 	}
-
-	w := int(header.BiWidth)
-	h := int(header.BiHeight)
-	isBottomUp := true
-	if h < 0 {
-		h = -h
-		isBottomUp = false
-	}
-
-	bpp := int(header.BiBitCount)
-	if bpp != 24 && bpp != 32 {
-		return nil, fmt.Errorf("不支援的色深: %d bpp", bpp)
-	}
-
-	headerOffset := uintptr(header.BiSize)
-	pixelBase := uintptr(pData) + headerOffset
-	rowPitch := ((w*(bpp/8) + 3) / 4) * 4
-
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
-
-	for y := 0; y < h; y++ {
-		srcRowY := y
-		if isBottomUp {
-			srcRowY = h - 1 - y
-		}
-		srcRow := pixelBase + uintptr(srcRowY*rowPitch)
-
-		for x := 0; x < w; x++ {
-			var b, g, r, a byte = 0, 0, 0, 255
-			if bpp == 24 {
-				p := srcRow + uintptr(x*3)
-				b = *(*byte)(unsafe.Pointer(p))
-				g = *(*byte)(unsafe.Pointer(p + 1))
-				r = *(*byte)(unsafe.Pointer(p + 2))
-			} else if bpp == 32 {
-				p := srcRow + uintptr(x*4)
-				b = *(*byte)(unsafe.Pointer(p))
-				g = *(*byte)(unsafe.Pointer(p + 1))
-				r = *(*byte)(unsafe.Pointer(p + 2))
-				a = *(*byte)(unsafe.Pointer(p + 3))
-				if a == 0 {
-					a = 255 // 某些 32-bit DIB 預設 alpha 為 0
-				}
-			}
-			offset := (y*w + x) * 4
-			img.Pix[offset] = r
-			img.Pix[offset+1] = g
-			img.Pix[offset+2] = b
-			img.Pix[offset+3] = a
-		}
-	}
-
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
+	img, err := decodeDIB(unsafe.Slice((*byte)(unsafe.Pointer(pData)), int(size)))
+	if err != nil {
 		return nil, err
 	}
-
+	var buf bytes.Buffer
+	if err = png.Encode(&buf, img); err != nil {
+		return nil, err
+	}
+	if buf.Len() > 7*1024*1024 {
+		return nil, fmt.Errorf("圖片超過 7 MiB")
+	}
 	return buf.Bytes(), nil
+}
+
+func validImageSize(w, h int) bool {
+	return w > 0 && h > 0 && w <= 16384 && h <= 16384 && int64(w)*int64(h) <= 16*1024*1024
+}
+
+func decodeDIB(data []byte) (*image.RGBA, error) {
+	bad := func() (*image.RGBA, error) { return nil, fmt.Errorf("不支援或損壞的 DIB") }
+	if len(data) < 40 {
+		return bad()
+	}
+	header := int(binary.LittleEndian.Uint32(data))
+	w := int(int32(binary.LittleEndian.Uint32(data[4:])))
+	rawH := int(int32(binary.LittleEndian.Uint32(data[8:])))
+	h := rawH
+	if h < 0 {
+		h = -h
+	}
+	bpp := int(binary.LittleEndian.Uint16(data[14:]))
+	if !validImageSize(w, h) || (bpp != 24 && bpp != 32) || binary.LittleEndian.Uint16(data[12:]) != 1 || binary.LittleEndian.Uint32(data[16:]) != 0 || binary.LittleEndian.Uint32(data[32:]) != 0 || header < 40 || header > len(data) {
+		return bad()
+	}
+	pitch := (w*(bpp/8) + 3) &^ 3
+	if int64(header)+int64(pitch)*int64(h) > int64(len(data)) {
+		return bad()
+	}
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		row := y
+		if rawH > 0 {
+			row = h - 1 - y
+		}
+		pixels := data[header+row*pitch : header+(row+1)*pitch]
+		for x := 0; x < w; x++ {
+			src := pixels[x*(bpp/8):]
+			dst := img.Pix[y*img.Stride+x*4:]
+			dst[0], dst[1], dst[2], dst[3] = src[2], src[1], src[0], 255
+			if bpp == 32 && src[3] != 0 {
+				dst[3] = src[3]
+			}
+		}
+	}
+	return img, nil
 }
 
 // WriteFileDrop 將檔案路徑寫入 Windows 系統剪貼簿 (CF_HDROP 格式)
 func WriteFileDrop(filePath string) error {
+	clipboardMu.Lock()
+	defer clipboardMu.Unlock()
 	utf16, err := syscall.UTF16FromString(filePath)
 	if err != nil {
 		return err
@@ -317,6 +350,12 @@ func WriteFileDrop(filePath string) error {
 		return fmt.Errorf("分配 CF_HDROP 記憶體失敗: %v", errAlloc)
 	}
 
+	owned := true
+	defer func() {
+		if owned {
+			procGlobalFree.Call(hMem)
+		}
+	}()
 	pMem, _, errLock := procGlobalLock.Call(hMem)
 	if pMem == 0 {
 		return fmt.Errorf("鎖定 CF_HDROP 記憶體失敗: %v", errLock)
@@ -327,12 +366,11 @@ func WriteFileDrop(filePath string) error {
 	df.FWide = 1 // Unicode
 
 	// 寫入 UTF-16 路徑
-	pPath := uintptr(unsafe.Pointer(pMem)) + uintptr(headerSize)
+	data := unsafe.Slice((*byte)(unsafe.Pointer(pMem)), totalSize)[headerSize:]
 	for i, ch := range utf16 {
-		binary.LittleEndian.PutUint16(unsafe.Slice((*byte)(unsafe.Pointer(pPath+uintptr(i*2))), 2), ch)
+		binary.LittleEndian.PutUint16(data[i*2:], ch)
 	}
-	// 結尾雙 NULL
-	binary.LittleEndian.PutUint16(unsafe.Slice((*byte)(unsafe.Pointer(pPath+uintptr(len(utf16)*2))), 2), 0)
+	binary.LittleEndian.PutUint16(data[len(utf16)*2:], 0)
 
 	procGlobalUnlock.Call(hMem)
 
@@ -349,6 +387,7 @@ func WriteFileDrop(filePath string) error {
 		return fmt.Errorf("設定 CF_HDROP 剪貼簿失敗: %v", errSet)
 	}
 
+	owned = false
 	return nil
 }
 
@@ -359,7 +398,7 @@ func GetSequenceNumber() uint32 {
 }
 
 // StartWatcher 啟動背景剪貼簿變動偵測協程 (支援文字與圖片變動自動感知)
-func StartWatcher(interval time.Duration, onTextChange func(string), onImageChange func([]byte)) {
+func StartWatcher(interval time.Duration, onTextChange func(string), onImageChange func([]byte), enabled func() bool) {
 	go func() {
 		lastSeq := GetSequenceNumber()
 		lastText, _ := ReadText()
@@ -368,6 +407,9 @@ func StartWatcher(interval time.Duration, onTextChange func(string), onImageChan
 		defer ticker.Stop()
 
 		for range ticker.C {
+			if enabled != nil && !enabled() {
+				continue
+			}
 			curSeq := GetSequenceNumber()
 			if curSeq != lastSeq {
 				lastSeq = curSeq

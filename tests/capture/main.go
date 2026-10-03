@@ -48,7 +48,8 @@ func saveBMP(filename string, width, height int, data []byte) error {
 func main() {
 	fmt.Println("======================================================")
 	fmt.Println("   Web KVM 畫面擷取模組 (Capture Engine) 綜合驗證")
-	fmt.Println("======================================================\n")
+	fmt.Println("======================================================")
+	fmt.Println()
 
 	// 1. 首選 DXGI GPU 高速引擎
 	var capEngine capture.Capturer = capture.NewDXGICapturer()

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -64,13 +65,14 @@ type Session struct {
 
 // 權限與安全管理器
 type AuthManager struct {
-	mu           sync.RWMutex
-	viewPwd      string
-	standardPwd  string
-	adminPwd     string
-	sessions     map[string]*Session     // token -> session
-	requests     map[string]*AuthRequest // requestID -> request
-	onRequestCB  func(req *AuthRequest)  // 當有新連線請求時的回呼函數 (通知 GUI 彈窗)
+	mu          sync.RWMutex
+	viewPwd     string
+	standardPwd string
+	adminPwd    string
+	sessions    map[string]*Session     // token -> session
+	requests    map[string]*AuthRequest // requestID -> request
+	failures    map[string]*loginFailures
+	onRequestCB func(req *AuthRequest) // 當有新連線請求時的回呼函數 (通知 GUI 彈窗)
 }
 
 // 建立全新權限管理器
@@ -78,6 +80,7 @@ func NewAuthManager(onNewRequest func(req *AuthRequest)) *AuthManager {
 	mgr := &AuthManager{
 		sessions:    make(map[string]*Session),
 		requests:    make(map[string]*AuthRequest),
+		failures:    make(map[string]*loginFailures),
 		onRequestCB: onNewRequest,
 	}
 	mgr.GenerateRandomPasswords()
@@ -89,7 +92,7 @@ func generateRandomPIN() string {
 	max := big.NewInt(1000000)
 	n, err := rand.Int(rand.Reader, max)
 	if err != nil {
-		return "666888"
+		panic("secure random source unavailable")
 	}
 	return fmt.Sprintf("%06d", n.Int64())
 }
@@ -98,10 +101,62 @@ func generateRandomPIN() string {
 func (m *AuthManager) GenerateRandomPasswords() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.viewPwd, m.standardPwd, m.adminPwd = uniquePINs("", "", "")
+	m.sessions = make(map[string]*Session)
+}
 
-	m.viewPwd = generateRandomPIN()
-	m.standardPwd = generateRandomPIN()
-	m.adminPwd = generateRandomPIN()
+func uniquePINs(v, s, a string) (string, string, string) {
+	if v == "" {
+		for {
+			v = generateRandomPIN()
+			if v != s && v != a {
+				break
+			}
+		}
+	}
+	if s == "" {
+		for {
+			s = generateRandomPIN()
+			if s != v && s != a {
+				break
+			}
+		}
+	}
+	if a == "" {
+		for {
+			a = generateRandomPIN()
+			if a != v && a != s {
+				break
+			}
+		}
+	}
+	return v, s, a
+}
+
+// ApplyPasswords changes all roles atomically; empty values disable password login.
+func (m *AuthManager) ApplyPasswords(v, s, a string) error {
+	if len([]rune(v)) > 64 || len([]rune(s)) > 64 || len([]rune(a)) > 64 {
+		return fmt.Errorf("密碼最多 64 個字元")
+	}
+	if (v != "" && (v == s || v == a)) || (s != "" && s == a) {
+		return fmt.Errorf("不同角色不可使用相同密碼")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.viewPwd, m.standardPwd, m.adminPwd = v, s, a
+	m.sessions = make(map[string]*Session)
+	return nil
+}
+
+func (m *AuthManager) InitPasswords(v, s, a string) error {
+	if len([]rune(v)) > 64 || len([]rune(s)) > 64 || len([]rune(a)) > 64 {
+		return fmt.Errorf("密碼最多 64 個字元")
+	}
+	if (v != "" && (v == s || v == a)) || (s != "" && s == a) {
+		return fmt.Errorf("不同角色不可使用相同密碼")
+	}
+	v, s, a = uniquePINs(v, s, a)
+	return m.ApplyPasswords(v, s, a)
 }
 
 // 取得當前三組密碼
@@ -111,48 +166,123 @@ func (m *AuthManager) GetPasswords() (viewPwd, standardPwd, adminPwd string) {
 	return m.viewPwd, m.standardPwd, m.adminPwd
 }
 
-// 設定指定角色的密碼
-func (m *AuthManager) SetPassword(role Role, newPwd string) {
+// 設定指定角色的密碼 (支援英文字母、數字與各類特殊符號)
+func (m *AuthManager) SetPassword(role Role, pwd string) error {
+	if len([]rune(pwd)) > 64 {
+		return fmt.Errorf("密碼最多 64 個字元")
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	switch role {
-	case RoleView:
-		m.viewPwd = newPwd
-	case RoleStandard:
-		m.standardPwd = newPwd
-	case RoleAdmin:
-		m.adminPwd = newPwd
+	passwords := []*string{&m.viewPwd, &m.standardPwd, &m.adminPwd}
+	if role < RoleView || role > RoleAdmin {
+		return fmt.Errorf("invalid role")
+	}
+	for i, p := range passwords {
+		if Role(i+1) != role && pwd != "" && *p == pwd {
+			return fmt.Errorf("不同角色不可使用相同密碼")
+		}
+	}
+	*passwords[int(role)-1] = pwd
+	for t, session := range m.sessions {
+		if session.Role == role {
+			delete(m.sessions, t)
+		}
+	}
+	return nil
+}
+
+type loginFailures struct {
+	Count                 int
+	Started, BlockedUntil time.Time
+}
+
+func (m *AuthManager) LoginRetryAfter(ip string) time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if f := m.failures[ip]; f != nil && time.Now().Before(f.BlockedUntil) {
+		return time.Until(f.BlockedUntil)
+	}
+	return 0
+}
+
+func (m *AuthManager) cleanupLocked() {
+	now := time.Now()
+	for t, session := range m.sessions {
+		if !now.Before(session.ExpiresAt) {
+			delete(m.sessions, t)
+		}
+	}
+	for id, req := range m.requests {
+		if req.Status == StatusPending && now.Sub(req.CreatedAt) >= time.Minute {
+			req.Status = StatusExpired
+		}
+		if now.Sub(req.CreatedAt) > 5*time.Minute {
+			delete(m.requests, id)
+		}
+	}
+	for ip, f := range m.failures {
+		if now.Sub(f.Started) > 2*time.Minute && !now.Before(f.BlockedUntil) {
+			delete(m.failures, ip)
+		}
 	}
 }
 
-// 透過密碼驗證權限，回傳對應授權之 Role 與 Session Token
+func (m *AuthManager) Cleanup() { m.mu.Lock(); defer m.mu.Unlock(); m.cleanupLocked() }
+
+// 透過密碼驗證權限，回傳對應授權之 Role 與 Session Token (使用常數時間比對防範計時攻擊)
 func (m *AuthManager) AuthenticateByPassword(pwd string, clientIP string) (Role, string, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.cleanupLocked()
+	now := time.Now()
+	f := m.failures[clientIP]
+	if f != nil && now.Before(f.BlockedUntil) {
+		return RoleNone, "", false
+	}
+	if f == nil {
+		if len(m.failures) >= 4096 {
+			return RoleNone, "", false
+		}
+		f = &loginFailures{Started: now}
+		m.failures[clientIP] = f
+	}
+	if now.Sub(f.Started) >= time.Minute {
+		f.Started = now
+		f.Count = 0
+	}
 
 	var role Role = RoleNone
 
 	if pwd != "" {
-		if pwd == m.adminPwd {
+		pwdBytes := []byte(pwd)
+		if len(m.adminPwd) > 0 && subtle.ConstantTimeCompare(pwdBytes, []byte(m.adminPwd)) == 1 {
 			role = RoleAdmin
-		} else if pwd == m.standardPwd {
+		} else if len(m.standardPwd) > 0 && subtle.ConstantTimeCompare(pwdBytes, []byte(m.standardPwd)) == 1 {
 			role = RoleStandard
-		} else if pwd == m.viewPwd {
+		} else if len(m.viewPwd) > 0 && subtle.ConstantTimeCompare(pwdBytes, []byte(m.viewPwd)) == 1 {
 			role = RoleView
 		}
 	}
 
 	if role == RoleNone {
+		f.Count++
+		if f.Count >= 5 {
+			f.BlockedUntil = now.Add(time.Minute)
+		}
 		return RoleNone, "", false
 	}
+	delete(m.failures, clientIP)
 
 	// 簽發 Session Token
 	token := m.generateTokenLocked(role, clientIP)
-	return role, token, true
+	return role, token, token != ""
 }
 
 // 產生隨機 Session Token (需在持有鎖時呼叫)
 func (m *AuthManager) generateTokenLocked(role Role, clientIP string) string {
+	if len(m.sessions) >= 4096 {
+		return ""
+	}
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	token := hex.EncodeToString(b)
@@ -188,6 +318,22 @@ func (m *AuthManager) ValidateToken(token string) (Role, bool) {
 // 遠端客戶端發起「請求被控端核准」
 func (m *AuthManager) CreateRequest(clientIP string) *AuthRequest {
 	m.mu.Lock()
+	m.cleanupLocked()
+	pending := 0
+	for _, req := range m.requests {
+		if req.Status == StatusPending {
+			pending++
+			if req.ClientIP == clientIP {
+				copy := *req
+				m.mu.Unlock()
+				return &copy
+			}
+		}
+	}
+	if pending >= 16 || len(m.requests) >= 256 {
+		m.mu.Unlock()
+		return nil
+	}
 
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
@@ -202,29 +348,39 @@ func (m *AuthManager) CreateRequest(clientIP string) *AuthRequest {
 
 	m.requests[reqID] = req
 	cb := m.onRequestCB
+	result := *req
 	m.mu.Unlock()
 
 	// 觸發 GUI 彈窗通知
 	if cb != nil {
-		go cb(req)
+		callbackReq := result
+		go cb(&callbackReq)
 	}
 
-	return req
+	return &result
 }
 
 // 被控端審核請求：同意並給予指定權限
 func (m *AuthManager) ApproveRequest(reqID string, role Role) (string, bool) {
+	if role < RoleView || role > RoleAdmin {
+		return "", false
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.cleanupLocked()
 	req, exists := m.requests[reqID]
 	if !exists || req.Status != StatusPending {
 		return "", false
 	}
 
+	token := m.generateTokenLocked(role, req.ClientIP)
+	if token == "" {
+		return "", false
+	}
 	req.Status = StatusApproved
 	req.GrantedRole = role
-	req.Token = m.generateTokenLocked(role, req.ClientIP)
+	req.Token = token
 
 	return req.Token, true
 }
@@ -234,6 +390,7 @@ func (m *AuthManager) RejectRequest(reqID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.cleanupLocked()
 	req, exists := m.requests[reqID]
 	if !exists || req.Status != StatusPending {
 		return false
@@ -245,8 +402,9 @@ func (m *AuthManager) RejectRequest(reqID string) bool {
 
 // 查詢連線請求狀態 (供前端輪詢或長連線狀態確認)
 func (m *AuthManager) GetRequestStatus(reqID string) (*AuthRequest, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cleanupLocked()
 
 	req, exists := m.requests[reqID]
 	if !exists {
@@ -258,7 +416,8 @@ func (m *AuthManager) GetRequestStatus(reqID string) (*AuthRequest, bool) {
 		req.Status = StatusExpired
 	}
 
-	return req, true
+	result := *req
+	return &result, true
 }
 
 // 撤銷指定 Token (中斷連線)
