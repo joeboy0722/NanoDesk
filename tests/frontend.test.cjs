@@ -6,7 +6,7 @@ const path = require('node:path');
 const { webcrypto } = require('node:crypto');
 
 function fixture() {
-  const elements = new Map(), sockets = [], decoders = [], requests = [], intervals = [];
+  const elements = new Map(), sockets = [], decoders = [], requests = [], intervals = [], windowHandlers = {};
   let now = 1000;
   class Element {
     constructor(tagName='DIV') { this.tagName=tagName; this.style={};this.children=[];this.handlers={};this.value='';this.checked=true;this.clientWidth=1024;this.clientHeight=768;this.width=800;this.height=600;this.classes=new Set();
@@ -45,10 +45,10 @@ function fixture() {
     abort(){if(this.onabort)this.onabort();if(this.onloadend)this.onloadend();}
   }
   const context={document,console:{log(){},warn(){},error(){}},WebSocket:Socket,VideoDecoder:Decoder,EncodedVideoChunk:class{constructor(values){Object.assign(this,values);}},MediaSource:class{},JMuxer:class{feed(){}destroy(){}},XMLHttpRequest:XHR,FormData:class{append(){}},performance:{now:()=>now},navigator:{onLine:true},localStorage:{removeItem(){}},crypto:webcrypto,Uint8Array,DataView,ArrayBuffer,setInterval(fn){intervals.push(fn);return intervals.length;},clearInterval(){},setTimeout(){return 1;},clearTimeout(){},requestAnimationFrame(fn){fn();},fetch(){return Promise.reject(new Error('unused'));}};
-  context.window=context;context.location={protocol:'https:',host:'localhost:8080'};context.addEventListener=()=>{};
+  context.window=context;context.location={protocol:'https:',host:'localhost:8080'};context.addEventListener=(type,fn)=>{(windowHandlers[type] ||= []).push(fn);};
   const source=fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8').replace(/\}\)\(\);\s*$/,`globalThis.hooks={handleControlMessage,handleBinaryVideoData,renderLaserPointer,canAutoClipboard,uploadFiles,connectWebSocket,applyZoom,getCanvasCoordinates,initDecoder,setToken(value){currentToken=value;},getDecoder(){return decoder;}};})();`);
   vm.runInNewContext(source,context);
-  return {hooks:context.hooks,elements,sockets,decoders,requests,intervals,advance(ms){now+=ms;}};
+  return {hooks:context.hooks,elements,sockets,decoders,requests,intervals,windowHandlers,advance(ms){now+=ms;},dispatchWindow(type,event){for(const fn of windowHandlers[type] || []) fn(event);}};
 }
 
 function authorize(f){f.hooks.setToken('secret');f.hooks.connectWebSocket();f.sockets.at(-1).onopen();f.hooks.handleControlMessage({type:'auth_success',role:2,role_name:'standard'});f.hooks.handleControlMessage({type:'my_info',id:'me',name:'me',color:'#123456'});}
@@ -75,6 +75,48 @@ test('token travels as WS message and upload header, never URL',()=>{
 });
 test('upload success requires complete server results',()=>{
   const f=fixture();authorize(f);f.hooks.uploadFiles([{name:'file.txt',size:3}]);const xhr=f.requests[0];xhr.status=200;xhr.responseText='{"status":"ok","results":[]}';xhr.onload();assert.match(f.elements.get('uploadProgressDetail').textContent,/傳輸失敗/);
+});
+
+test('upload follows host limit above 4 GiB and still rejects oversized batches',()=>{
+  const f=fixture();authorize(f);
+  const init=limit=>f.hooks.handleControlMessage({type:'init',monitors:[],current:0,max_upload_bytes:limit});
+  const gib=1024**3;
+  f.hooks.uploadFiles([{name:'large.bin',size:5*gib}]);assert.equal(f.requests.length,0);
+  init(2*gib);
+  const decoderCount=f.decoders.length;
+  f.hooks.handleControlMessage({type:'upload_limits',max_upload_bytes:10*gib});
+  assert.equal(f.decoders.length,decoderCount); // A setting change must not reset the video decoder.
+  f.hooks.uploadFiles([{name:'too-large.bin',size:11*gib}]);assert.equal(f.requests.length,0);
+  f.hooks.uploadFiles([{name:'large.bin',size:5*gib}]);assert.equal(f.requests.length,1);
+});
+
+function mouseEvent(button=0){return {button,clientX:120,clientY:80,preventDefault(){this.prevented=true;}};}
+function dispatchDisplayMouse(f,el,type,event){
+  if(el.handlers[type])el.handlers[type](event);
+  f.dispatchWindow(type,event); // DOM mouse events bubble to window.
+}
+
+test('double click forwards exactly down/up/down/up on canvas and video',()=>{
+  for(const id of ['screenCanvas','screenVideo']){
+    const f=fixture();authorize(f);const el=f.elements.get(id);
+    for(let i=0;i<2;i++){
+      const down=mouseEvent();dispatchDisplayMouse(f,el,'mousedown',down);assert.equal(down.prevented,true);
+      dispatchDisplayMouse(f,el,'mouseup',mouseEvent());
+    }
+    const buttons=f.sockets[0].sent.filter(m=>m.type==='mouse_button');
+    assert.deepEqual(buttons.map(m=>m.isDown),[true,false,true,false]);
+    assert.ok(buttons.every(m=>m.button===0));
+  }
+});
+
+test('drag release outside display is sent once and unrelated mouseup is ignored',()=>{
+  const f=fixture();authorize(f);const el=f.elements.get('screenCanvas');
+  f.dispatchWindow('mouseup',mouseEvent());
+  dispatchDisplayMouse(f,el,'mousedown',mouseEvent(2));
+  f.dispatchWindow('mouseup',mouseEvent(2));f.dispatchWindow('mouseup',mouseEvent(2));
+  assert.deepEqual(f.sockets[0].sent.filter(m=>m.type==='mouse_button').map(m=>[m.button,m.isDown]),[[2,true],[2,false]]);
+  dispatchDisplayMouse(f,el,'mousedown',mouseEvent());f.dispatchWindow('blur',{});f.dispatchWindow('mouseup',mouseEvent());
+  assert.equal(f.sockets[0].sent.at(-1).type,'release_all_keys');
 });
 test('failed decoder is replaced and codec is derived from SPS',()=>{
   const f=fixture();authorize(f);

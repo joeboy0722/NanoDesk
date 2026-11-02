@@ -175,7 +175,7 @@ func (h *StreamHub) expireControl() {
 
 func (h *StreamHub) broadcastInit() {
 	h.mu.Lock()
-	msg := map[string]interface{}{"type": "init", "monitors": h.monitors, "current": h.currentMonitor}
+	msg := map[string]interface{}{"type": "init", "monitors": h.monitors, "current": h.currentMonitor, "max_upload_bytes": maxUploadBytes.Load()}
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
 		if h.validLocked(c) {
@@ -233,6 +233,21 @@ func primaryMonitor(monitors []capture.Monitor) int {
 		}
 	}
 	return 0
+}
+
+func (h *StreamHub) broadcastUploadLimit() {
+	h.mu.Lock()
+	clients := make([]*Client, 0, len(h.clients))
+	for c := range h.clients {
+		if h.validLocked(c) {
+			clients = append(clients, c)
+		}
+	}
+	h.mu.Unlock()
+	msg := map[string]interface{}{"type": "upload_limits", "max_upload_bytes": maxUploadBytes.Load()}
+	for _, c := range clients {
+		c.safeSendJSON(msg)
+	}
 }
 
 func (c *Client) reject() {

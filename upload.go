@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -15,7 +16,22 @@ import (
 	"kvm/auth"
 )
 
-const maxUploadBytes = 1024 * 1024 * 1024
+const gibibyte int64 = 1024 * 1024 * 1024
+
+var maxUploadBytes atomic.Int64
+
+func init() { maxUploadBytes.Store(gibibyte) }
+
+func uploadLimitBytes(gib int64) (int64, error) {
+	if gib < 1 || gib > ((1<<53)-1)/gibibyte {
+		return 0, fmt.Errorf("傳輸上限必須是 1 至 %d 的整數（GiB）", ((1<<53)-1)/gibibyte)
+	}
+	return gib * gibibyte, nil
+}
+
+func uploadLimitLabel(limit int64) string {
+	return fmt.Sprintf("%d GiB", limit/gibibyte)
+}
 
 var uploadSlots = make(chan struct{}, 4)
 var moveFile = syscall.NewLazyDLL("kernel32.dll").NewProc("MoveFileW")
@@ -86,8 +102,9 @@ func (s sessionReader) Read(p []byte) (int, error) {
 }
 
 func (h *StreamHub) handleUpload(w http.ResponseWriter, r *http.Request) {
-	if r.ContentLength > maxUploadBytes {
-		writeJSONError(w, 413, "含傳輸封裝需小於 1 GiB")
+	limit := maxUploadBytes.Load()
+	if r.ContentLength > limit {
+		writeJSONError(w, 413, "含傳輸封裝不可超過 "+uploadLimitLabel(limit))
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -112,15 +129,15 @@ func (h *StreamHub) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, 500, err.Error())
 		return
 	}
-	h.receiveUpload(w, r, token, dir)
+	h.receiveUpload(w, r, token, dir, limit)
 }
 
-func (h *StreamHub) receiveUpload(w http.ResponseWriter, r *http.Request, token, dir string) {
+func (h *StreamHub) receiveUpload(w http.ResponseWriter, r *http.Request, token, dir string, limit int64) {
 	controller := http.NewResponseController(w)
 	defer controller.SetReadDeadline(time.Time{})
 	// Refresh the network deadline on body reads, including multipart headers.
 	r.Body = &uploadBody{ReadCloser: r.Body, controller: controller}
-	r.Body = http.MaxBytesReader(w, r.Body, maxUploadBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	reader, err := r.MultipartReader()
 	if err != nil {
 		writeJSONError(w, 400, "不合法的上傳格式")
@@ -134,7 +151,7 @@ func (h *StreamHub) receiveUpload(w http.ResponseWriter, r *http.Request, token,
 			break
 		}
 		if err != nil {
-			results = append(results, uploadResult{Error: "上傳中斷、格式錯誤或超過 1 GiB"})
+			results = append(results, uploadResult{Error: "上傳中斷、格式錯誤或超過 " + uploadLimitLabel(limit)})
 			status = "error"
 			break
 		}

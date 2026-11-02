@@ -305,9 +305,10 @@ func (h *StreamHub) sendInitInfo(c *Client) {
 	h.mu.Unlock()
 
 	c.safeSendJSON(map[string]interface{}{
-		"type":     "init",
-		"monitors": monitors,
-		"current":  curMon,
+		"type":             "init",
+		"monitors":         monitors,
+		"current":          curMon,
+		"max_upload_bytes": maxUploadBytes.Load(),
 	})
 
 	// 3. 發送客戶端自身協同身分資訊 (ID、預設名稱、專屬標籤顏色)
@@ -787,6 +788,16 @@ func main() {
 		gui.ShowFatalError("設定檔錯誤", "%v", appCfg.LoadError)
 		return
 	}
+	uploadGiB := appCfg.UploadLimitGiB
+	if uploadGiB == 0 {
+		uploadGiB = 1
+	} // Settings written before this option existed.
+	limit, limitErr := uploadLimitBytes(uploadGiB)
+	if limitErr != nil {
+		gui.ShowFatalError("傳輸大小設定錯誤", "%v", limitErr)
+		return
+	}
+	maxUploadBytes.Store(limit)
 	if flagPwd != "" {
 		// 若透過命令列指定，直接套用全權限密碼
 		if err := authMgr.SetPassword(auth.RoleAdmin, flagPwd); err != nil {
@@ -813,7 +824,30 @@ func main() {
 	serverURLs = append(serverURLs, fmt.Sprintf("%s://localhost:%d", serverProtocol, port))
 	hostGUI = gui.StartHostGUI(authMgr, serverURLs, func() {
 		hub.kickAllClients()
-	}, func() { go hub.recoverCapture() })
+	}, func() { go hub.recoverCapture() }, gui.UploadSettings{
+		GiB: uploadGiB,
+		Apply: func(gib int64) error {
+			limit, err := uploadLimitBytes(gib)
+			if err != nil {
+				return err
+			}
+			cfg := config.LoadConfig()
+			if cfg.LoadError != nil {
+				return cfg.LoadError
+			}
+			// Saving just the upload setting must preserve random passwords on next startup.
+			if !cfg.Loaded {
+				cfg.RememberPasswords = false
+			}
+			cfg.UploadLimitGiB = gib
+			if err := config.SaveConfig(cfg); err != nil {
+				return err
+			}
+			maxUploadBytes.Store(limit)
+			hub.broadcastUploadLimit()
+			return nil
+		},
+	})
 	hub.hostGUI = hostGUI
 
 	// 啟動背景推流工作協程

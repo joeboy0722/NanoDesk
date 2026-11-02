@@ -50,6 +50,7 @@ func TestConfigSaveAndLoad(t *testing.T) {
 		ViewPassword:      "View*Special@123",
 		StandardPassword:  "Std&Control#456",
 		AdminPassword:     "SuperAdmin!Secret$789",
+		UploadLimitGiB:    10,
 	}
 
 	if err := SaveConfig(testCfg); err != nil {
@@ -61,6 +62,9 @@ func TestConfigSaveAndLoad(t *testing.T) {
 		t.Fatal("password stored in plaintext", err)
 	}
 	loaded := LoadConfig()
+	if loaded.UploadLimitGiB != 10 {
+		t.Fatalf("upload limit lost: %d", loaded.UploadLimitGiB)
+	}
 	if !loaded.RememberPasswords {
 		t.Errorf("RememberPasswords 預期為 true，得到 false")
 	}

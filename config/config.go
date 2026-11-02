@@ -14,6 +14,7 @@ import (
 type AppConfig struct {
 	Loaded            bool   `json:"-"`
 	LoadError         error  `json:"-"`
+	UploadLimitGiB    int64  `json:"upload_limit_gib,omitempty"`
 	RememberPasswords bool   `json:"remember_passwords"` // 是否保留自訂密碼 (預設 true)
 	ViewPassword      string `json:"view_password"`      // 僅觀看自訂密碼
 	StandardPassword  string `json:"standard_password"`  // 一般控制自訂密碼

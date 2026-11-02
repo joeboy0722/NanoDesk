@@ -309,7 +309,7 @@ func TestConcurrentUploadsDoNotOverwrite(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			w := httptest.NewRecorder()
-			h.receiveUpload(w, uploadRequest(t, "same.txt", fmt.Sprint(i)), c.token, dir)
+			h.receiveUpload(w, uploadRequest(t, "same.txt", fmt.Sprint(i)), c.token, dir, maxUploadBytes.Load())
 			var reply struct {
 				Status  string
 				Results []uploadResult
@@ -363,7 +363,7 @@ func TestUploadErrorsAndCancellation(t *testing.T) {
 				h.authMgr.RevokeToken(c.token)
 			}
 			w := httptest.NewRecorder()
-			h.receiveUpload(w, r, c.token, destination)
+			h.receiveUpload(w, r, c.token, destination, maxUploadBytes.Load())
 			var reply struct {
 				Status  string
 				Results []uploadResult

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -67,6 +69,7 @@ const (
 	BS_PUSHBUTTON  = 0x00000000
 	ES_AUTOHSCROLL = 0x00000080
 	ES_READONLY    = 0x00000800
+	ES_NUMBER      = 0x00002000
 	SS_LEFT        = 0x00000000
 
 	WM_DESTROY  = 0x0002
@@ -126,6 +129,8 @@ const (
 	ID_BTN_SAVE_PWD  = 1007
 	ID_BTN_APPLY_PWD = 1008
 	ID_URL_SELECT    = 1009
+	ID_EDIT_UPLOAD   = 1010
+	ID_BTN_UPLOAD    = 1011
 
 	// 審核視窗控制項 ID
 	ID_PROMPT_VIEW = 2001
@@ -174,21 +179,29 @@ type WNDCLASSEXW struct {
 
 // 主機 GUI 管理視窗
 type HostGUI struct {
-	mu              sync.Mutex
-	hwnd            uintptr
-	authMgr         *auth.AuthManager
-	serverURL       string
-	serverURLs      []string
-	urlCombo        uintptr
-	onKickAll       func()
-	onDisplayChange func()
-	editViewHwnd    uintptr
-	editStdHwnd     uintptr
-	editAdmHwnd     uintptr
-	statusTextHwnd  uintptr
-	clientsTextHwnd uintptr
-	hFont           uintptr
-	ready           bool
+	mu               sync.Mutex
+	hwnd             uintptr
+	authMgr          *auth.AuthManager
+	serverURL        string
+	serverURLs       []string
+	urlCombo         uintptr
+	onKickAll        func()
+	onDisplayChange  func()
+	editViewHwnd     uintptr
+	editStdHwnd      uintptr
+	editAdmHwnd      uintptr
+	statusTextHwnd   uintptr
+	clientsTextHwnd  uintptr
+	hFont            uintptr
+	ready            bool
+	uploadSettings   UploadSettings
+	editUploadHwnd   uintptr
+	uploadStatusHwnd uintptr
+}
+
+type UploadSettings struct {
+	GiB   int64
+	Apply func(int64) error
 }
 
 var globalGUI *HostGUI
@@ -219,11 +232,12 @@ func HideConsoleWindow() {
 }
 
 // 建立並啟動被控端原生 GUI 視窗
-func StartHostGUI(authMgr *auth.AuthManager, serverURLs []string, onKickAll func(), onDisplayChange func()) *HostGUI {
+func StartHostGUI(authMgr *auth.AuthManager, serverURLs []string, onKickAll func(), onDisplayChange func(), upload UploadSettings) *HostGUI {
 	gui := &HostGUI{
 		authMgr:   authMgr,
 		serverURL: serverURLs[0], serverURLs: serverURLs,
 		onKickAll: onKickAll, onDisplayChange: onDisplayChange,
+		uploadSettings: upload,
 	}
 	globalGUI = gui
 
@@ -356,6 +370,21 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 		}
 
 		switch wmId {
+		case ID_BTN_UPLOAD:
+			if globalGUI != nil && globalGUI.uploadSettings.Apply != nil {
+				gib, err := strconv.ParseInt(strings.TrimSpace(getControlText(globalGUI.editUploadHwnd)), 10, 64)
+				if err != nil {
+					ShowErrorMessage("傳輸上限未儲存", "請輸入有效的整數 GiB。")
+					return 0
+				}
+				if err = globalGUI.uploadSettings.Apply(gib); err != nil {
+					ShowErrorMessage("傳輸上限未儲存", "%v", err)
+					return 0
+				}
+				globalGUI.uploadSettings.GiB = gib
+				text, _ := syscall.UTF16PtrFromString(fmt.Sprintf("已儲存 %d GiB，新傳輸立即生效（含封裝）。", gib))
+				procSetWindowTextW.Call(globalGUI.uploadStatusHwnd, uintptr(unsafe.Pointer(text)))
+			}
 		case ID_TRAY_SHOW:
 			procShowWindow.Call(hwnd, uintptr(SW_SHOW))
 			procSetForegroundWindow.Call(hwnd)
@@ -387,6 +416,7 @@ func wndProc(hwnd uintptr, msg uint32, wParam uintptr, lParam uintptr) uintptr {
 
 				// 儲存至本地設定檔 (config.json)
 				err := config.SaveConfig(&config.AppConfig{
+					UploadLimitGiB:    globalGUI.uploadSettings.GiB,
 					RememberPasswords: true,
 					ViewPassword:      v,
 					StandardPassword:  s,
@@ -514,7 +544,7 @@ func (g *HostGUI) runWindowLoop() {
 		uintptr(unsafe.Pointer(className)),
 		uintptr(unsafe.Pointer(windowTitle)),
 		uintptr(WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_VISIBLE),
-		100, 100, 480, 400,
+		100, 100, 480, 480,
 		0, 0, hInstance, 0,
 	)
 
@@ -570,14 +600,22 @@ func (g *HostGUI) runWindowLoop() {
 	// 分隔裝飾
 	g.createControl("STATIC", "──────────────────────────────────────────────", SS_LEFT, 20, 225, 420, 15, 0)
 
-	// 3. 連線狀態與安全特權說明
+	// 3. File-transfer limit is independent of password changes.
+	g.createControl("STATIC", "每批傳輸上限:", SS_LEFT, 20, 247, 135, 20, 0)
+	g.editUploadHwnd = g.createControl("EDIT", strconv.FormatInt(g.uploadSettings.GiB, 10), WS_BORDER|ES_AUTOHSCROLL|ES_NUMBER, 155, 243, 105, 24, ID_EDIT_UPLOAD)
+	g.createControl("STATIC", "GiB", SS_LEFT, 270, 247, 45, 20, 0)
+	g.createControl("BUTTON", "套用並儲存", BS_PUSHBUTTON, 330, 243, 110, 26, ID_BTN_UPLOAD)
+	g.uploadStatusHwnd = g.createControl("STATIC", "預設 1 GiB；每批含封裝，設定後立即生效。", SS_LEFT, 20, 279, 420, 20, 0)
+	g.createControl("STATIC", "──────────────────────────────────────────────", SS_LEFT, 20, 305, 420, 15, 0)
+
+	// 4. 連線狀態與安全特權說明
 	g.mu.Lock()
-	g.clientsTextHwnd = g.createControl("STATIC", "連線狀態: 待命中 (尚無外部客戶端連入)", SS_LEFT, 20, 245, 420, 20, 0)
+	g.clientsTextHwnd = g.createControl("STATIC", "連線狀態: 待命中 (尚無外部客戶端連入)", SS_LEFT, 20, 325, 420, 20, 0)
 	g.mu.Unlock()
-	g.createControl("STATIC", "💡 最高特權保護: 被控端主人一碰實體鍵鼠，即刻壓制並奪回控制！", SS_LEFT, 20, 275, 430, 20, 0)
+	g.createControl("STATIC", "💡 最高特權保護: 被控端主人一碰實體鍵鼠，即刻壓制並奪回控制！", SS_LEFT, 20, 355, 430, 20, 0)
 
 	// 4. 緊急一鍵斷開按鈕
-	g.createControl("BUTTON", "🛑 一鍵斷開所有遠端連線", BS_PUSHBUTTON, 130, 310, 200, 36, ID_BTN_KICK_ALL)
+	g.createControl("BUTTON", "🛑 一鍵斷開所有遠端連線", BS_PUSHBUTTON, 130, 390, 200, 36, ID_BTN_KICK_ALL)
 
 	procShowWindow.Call(hwnd, uintptr(SW_SHOW))
 	procUpdateWindow.Call(hwnd)

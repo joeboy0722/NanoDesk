@@ -97,6 +97,7 @@
  let lastFrameRenderedTime = performance.now();
  let remoteWidth = 0, remoteHeight = 0;
  let activeUpload = null;
+ let maxUploadBytes = 1024 * 1024 * 1024;
  const clipboardAuto = document.getElementById('clipboardAuto');
  const zoomSelect = document.getElementById('zoomSelect');
  const encrypted = window.location.protocol === 'https:';
@@ -124,6 +125,7 @@
   viewport.style.justifyContent=fit?'center':'flex-start'; viewport.style.alignItems=fit?'center':'flex-start'; viewport.style.overflow=fit?'hidden':'auto';
  }
  function loseAuthorization() {
+  pressedMouseButtons.clear();
   currentToken=''; currentRole=0; authenticatedSocket=false;shortcutGroup.style.display='none';monitorSelect.disabled=true;clipboardAuto.disabled=true;controlActionBtn.classList.add('hidden');
   if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}
   if(ws){ws.onclose=null;ws.close();ws=null;}
@@ -494,7 +496,10 @@
             // Token 失效或被踢除
             loseAuthorization();
             showToast('⚠️ 連線憑證已失效，請重新授權');
+        } else if (msg.type === 'upload_limits') {
+            if (Number.isSafeInteger(msg.max_upload_bytes) && msg.max_upload_bytes > 0) maxUploadBytes = msg.max_upload_bytes;
         } else if (msg.type === 'init') {
+            if (Number.isSafeInteger(msg.max_upload_bytes) && msg.max_upload_bytes > 0) maxUploadBytes = msg.max_upload_bytes;
             // 初始化螢幕選單清單
             monitorSelect.innerHTML = '';
             msg.monitors.forEach(m => {
@@ -676,6 +681,7 @@
 
     // 7. 滑鼠事件監聽 (同時相容 Canvas 與 Video 播放元件)
     let moveThrottle = false;
+    const pressedMouseButtons = new Set();
     const displayElements = [canvas, video].filter(Boolean);
 
     displayElements.forEach(el => {
@@ -699,10 +705,12 @@
 
         el.addEventListener('mousedown', (e) => {
             if (currentRole < 2) return;
+            e.preventDefault(); // Keep selection and native video dragging from interrupting clicks.
             el.focus();
 
             const pos = getCanvasCoordinates(e);
             if (pos) {
+                pressedMouseButtons.add(e.button);
                 sendControl({ type: 'mouse_move', x: pos.normX, y: pos.normY });
                 sendControl({
                     type: 'mouse_button',
@@ -710,15 +718,6 @@
                     isDown: true
                 });
             }
-        });
-
-        el.addEventListener('mouseup', (e) => {
-            if (currentRole < 2) return;
-            sendControl({
-                type: 'mouse_button',
-                button: e.button,
-                isDown: false
-            });
         });
 
         el.addEventListener('contextmenu', (e) => {
@@ -830,11 +829,13 @@
         checkAndSyncLocalClipboardImage();
     });
 
-    document.addEventListener('visibilitychange',()=>{if(document.hidden)sendControl({type:'release_all_keys'});});
+    document.addEventListener('visibilitychange',()=>{if(document.hidden){pressedMouseButtons.clear();sendControl({type:'release_all_keys'});}});
  window.addEventListener('online',()=>scheduleReconnect(true));
  window.addEventListener('offline',()=>{if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;}statusText.textContent='網路離線';});
- window.addEventListener('mouseup',e=>{if(currentRole>=2)sendControl({type:'mouse_button',button:e.button,isDown:false});});
+ // Handle release once, including when a drag ends outside the display.
+ window.addEventListener('mouseup',e=>{if(pressedMouseButtons.delete(e.button) && currentRole>=2)sendControl({type:'mouse_button',button:e.button,isDown:false});});
  window.addEventListener('blur', () => {
+        pressedMouseButtons.clear();
         if (currentRole >= 2) {
             sendControl({ type: 'release_all_keys' });
         }
@@ -912,13 +913,14 @@
         if (!bytes || bytes <= 0) return '0 B';
         if (bytes < 1024) return bytes + ' B';
         if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        if (bytes >= 1024 * 1024 * 1024) return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GiB';
         return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
     function uploadFiles(files) {
         if (!files || files.length === 0) return;
  if(activeUpload){showToast("已有檔案傳送中");return;}
- if(files.length>100 || Array.from(files).reduce((sum,f)=>sum+f.size,0)>1024*1024*1024-1024*1024){showToast("單次最多 100 個檔案，含傳輸封裝需小於 1 GiB");return;}
+ if(files.length>100 || Array.from(files).reduce((sum,f)=>sum+f.size,0)>maxUploadBytes-1024*1024){showToast(`單次最多 100 個檔案，含傳輸封裝不可超過 ${formatBytes(maxUploadBytes)}`);return;}
         if (currentRole < 2) {
             showToast('🔒 僅觀看模式禁止傳送檔案');
             return;
