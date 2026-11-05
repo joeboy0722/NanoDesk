@@ -9,8 +9,8 @@ import (
 	"time"
 	"unsafe"
 
-	"kvm/capture"
-	"kvm/encoder"
+	"kvm/core/capture"
+	"kvm/core/encoder"
 )
 
 type memoryCounters struct {

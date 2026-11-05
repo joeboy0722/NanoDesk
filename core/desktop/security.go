@@ -1,71 +1,12 @@
-package main
+package desktop
 
 import (
-	"encoding/json"
-	"fmt"
-	"net"
-	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
-	"kvm/auth"
-	"kvm/capture"
-	"kvm/input"
+	"kvm/core/auth"
+	"kvm/core/capture"
+	"kvm/core/input"
 )
-
-func requestIP(r *http.Request) string {
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return ip
-}
-
-func sameOrigin(r *http.Request) bool {
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		return true
-	}
-	u, err := url.Parse(origin)
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return err == nil && u.Scheme == scheme && strings.EqualFold(u.Host, r.Host) && u.User == nil
-}
-
-func secureHandler(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
-		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/upload" {
-			w.Header().Set("Cache-Control", "no-store")
-		}
-		if !sameOrigin(r) {
-			http.Error(w, "Forbidden origin", http.StatusForbidden)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func writeJSONError(w http.ResponseWriter, status int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(map[string]string{"error": message})
-}
-
-func rejectLimitedLogin(w http.ResponseWriter, mgr *auth.AuthManager, ip string) bool {
-	if retry := mgr.LoginRetryAfter(ip); retry > 0 {
-		w.Header().Set("Retry-After", fmt.Sprint(int(retry.Seconds())+1))
-		writeJSONError(w, 429, "登入嘗試過多，請於 60 秒後重試")
-		return true
-	}
-	return false
-}
 
 func (c *Client) close() {
 	c.closeOnce.Do(func() {
@@ -127,7 +68,11 @@ func (h *StreamHub) clientAlive(c *Client) bool {
 		return false
 	}
 	if !c.authed {
-		return time.Since(c.connected) < 10*time.Second
+		window := c.approvalWindow
+		if window == 0 {
+			window = 10 * time.Second
+		}
+		return time.Since(c.connected) < window
 	}
 	return h.validLocked(c)
 }
@@ -194,6 +139,11 @@ func (h *StreamHub) recoverCapture() {
 	defer h.inputMu.Unlock()
 	h.streamMu.Lock()
 	defer h.streamMu.Unlock()
+	select {
+	case <-h.done:
+		return
+	default:
+	}
 	if time.Since(h.lastRecovery) < 2*time.Second {
 		return
 	}
@@ -252,7 +202,7 @@ func (h *StreamHub) broadcastUploadLimit() {
 
 func (c *Client) reject() {
 	if c.conn != nil {
-		c.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(1008, "授權已失效"), time.Now().Add(time.Second))
+		c.conn.WriteControl(MessageClose, append([]byte{3, 240}, []byte("授權已失效")...), time.Now().Add(time.Second))
 	}
 	c.close()
 }

@@ -10,7 +10,7 @@
 # 測試輸出與暫存畫面
 *.bmp
 *.png
-!web/logo.png
+!web/assets/logo.png
 *.jpg
 *.h264
 
@@ -22,3 +22,9 @@ Desktop.ini
 
 # 本地密碼組態設定檔
 config.json
+
+# Local native server state and TLS private material
+*.db
+*.db.lock
+*.key
+state.bin

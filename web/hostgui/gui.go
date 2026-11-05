@@ -11,9 +11,9 @@ import (
 	"time"
 	"unsafe"
 
-	"kvm/auth"
-	"kvm/clipboard"
-	"kvm/config"
+	"kvm/core/auth"
+	"kvm/core/clipboard"
+	"kvm/core/config"
 )
 
 var (

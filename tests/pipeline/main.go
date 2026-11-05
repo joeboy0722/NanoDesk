@@ -5,8 +5,8 @@ import (
 	"os"
 	"time"
 
-	"kvm/capture"
-	"kvm/encoder"
+	"kvm/core/capture"
+	"kvm/core/encoder"
 )
 
 func main() {

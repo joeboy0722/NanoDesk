@@ -1,4 +1,4 @@
-#include "../../capture/dxgi.cpp"
+#include "../../core/capture/dxgi.cpp"
 #include <assert.h>
 
 int main() {

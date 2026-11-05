@@ -398,7 +398,9 @@ func GetSequenceNumber() uint32 {
 }
 
 // StartWatcher 啟動背景剪貼簿變動偵測協程 (支援文字與圖片變動自動感知)
-func StartWatcher(interval time.Duration, onTextChange func(string), onImageChange func([]byte), enabled func() bool) {
+func StartWatcher(interval time.Duration, onTextChange func(string), onImageChange func([]byte), enabled func() bool) func() {
+	done := make(chan struct{})
+	var once sync.Once
 	go func() {
 		lastSeq := GetSequenceNumber()
 		lastText, _ := ReadText()
@@ -406,7 +408,12 @@ func StartWatcher(interval time.Duration, onTextChange func(string), onImageChan
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
 			if enabled != nil && !enabled() {
 				continue
 			}
@@ -434,4 +441,5 @@ func StartWatcher(interval time.Duration, onTextChange func(string), onImageChan
 			}
 		}
 	}()
+	return func() { once.Do(func() { close(done) }) }
 }

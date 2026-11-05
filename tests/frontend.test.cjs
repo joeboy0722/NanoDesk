@@ -46,7 +46,7 @@ function fixture() {
   }
   const context={document,console:{log(){},warn(){},error(){}},WebSocket:Socket,VideoDecoder:Decoder,EncodedVideoChunk:class{constructor(values){Object.assign(this,values);}},MediaSource:class{},JMuxer:class{feed(){}destroy(){}},XMLHttpRequest:XHR,FormData:class{append(){}},performance:{now:()=>now},navigator:{onLine:true},localStorage:{removeItem(){}},crypto:webcrypto,Uint8Array,DataView,ArrayBuffer,setInterval(fn){intervals.push(fn);return intervals.length;},clearInterval(){},setTimeout(){return 1;},clearTimeout(){},requestAnimationFrame(fn){fn();},fetch(){return Promise.reject(new Error('unused'));}};
   context.window=context;context.location={protocol:'https:',host:'localhost:8080'};context.addEventListener=(type,fn)=>{(windowHandlers[type] ||= []).push(fn);};
-  const source=fs.readFileSync(path.join(__dirname,'../web/app.js'),'utf8').replace(/\}\)\(\);\s*$/,`globalThis.hooks={handleControlMessage,handleBinaryVideoData,renderLaserPointer,canAutoClipboard,uploadFiles,connectWebSocket,applyZoom,getCanvasCoordinates,initDecoder,setToken(value){currentToken=value;},getDecoder(){return decoder;}};})();`);
+  const source=fs.readFileSync(path.join(__dirname,'../web/assets/app.js'),'utf8').replace(/\}\)\(\);\s*$/,`globalThis.hooks={handleControlMessage,handleBinaryVideoData,renderLaserPointer,canAutoClipboard,uploadFiles,connectWebSocket,applyZoom,getCanvasCoordinates,initDecoder,setToken(value){currentToken=value;},getDecoder(){return decoder;}};})();`);
   vm.runInNewContext(source,context);
   return {hooks:context.hooks,elements,sockets,decoders,requests,intervals,windowHandlers,advance(ms){now+=ms;},dispatchWindow(type,event){for(const fn of windowHandlers[type] || []) fn(event);}};
 }

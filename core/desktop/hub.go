@@ -1,49 +1,20 @@
-package main
+package desktop
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"embed"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
-	"encoding/pem"
-	"flag"
 	"fmt"
-	"io/fs"
-	"math/big"
-	"net"
-	"net/http"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"kvm/auth"
-	"kvm/capture"
-	"kvm/clipboard"
-	"kvm/config"
-	"kvm/encoder"
-	"kvm/gui"
-	"kvm/input"
-
-	"github.com/gorilla/websocket"
+	"kvm/core/auth"
+	"kvm/core/capture"
+	"kvm/core/clipboard"
+	"kvm/core/encoder"
+	"kvm/core/input"
 )
-
-// 內嵌前端靜態資源 (HTML5 / CSS / JS)，免除零散檔案，編譯為單一執行檔
-//
-//go:embed web/*
-var embeddedWebFS embed.FS
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return sameOrigin(r)
-	},
-}
 
 // 協同使用者專屬色盤 (用於指針與成員徽章辨識)
 var userColors = []string{
@@ -60,7 +31,7 @@ var clientSeq uint64
 
 // Client 客戶端連線結構 (具備獨立存取權限、身分 Token 與多人協同狀態)
 type Client struct {
-	conn             *websocket.Conn
+	conn             Transport
 	mu               sync.Mutex
 	id               string
 	name             string
@@ -70,6 +41,7 @@ type Client struct {
 	role             auth.Role
 	authed           bool
 	connected        time.Time
+	approvalWindow   time.Duration
 	sendChan         chan []byte // 視訊畫面封包非阻塞緩衝管道 (容量 10 幀)
 	closeOnce        sync.Once
 	jsonChan         chan outboundMessage
@@ -131,7 +103,7 @@ func (c *Client) writePump(h *StreamHub) {
 			}
 			c.mu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(time.Second))
-			err := c.conn.WriteMessage(websocket.TextMessage, message.data)
+			err := c.conn.WriteMessage(MessageControl, message.data)
 			c.mu.Unlock()
 			if err != nil {
 				return
@@ -139,7 +111,7 @@ func (c *Client) writePump(h *StreamHub) {
 		case data, ok := <-c.sendChan:
 			if !ok {
 				c.mu.Lock()
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.conn.WriteMessage(MessageClose, []byte{})
 				c.mu.Unlock()
 				return
 			}
@@ -149,7 +121,7 @@ func (c *Client) writePump(h *StreamHub) {
 			}
 			c.mu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			err := c.conn.WriteMessage(websocket.BinaryMessage, data)
+			err := c.conn.WriteMessage(MessageVideo, data)
 			c.mu.Unlock()
 			if err != nil {
 				return
@@ -164,10 +136,10 @@ func (c *Client) writePump(h *StreamHub) {
 			h.authMgr.Cleanup()
 			c.mu.Lock()
 			// 1. 發送標準底層 WebSocket Ping 封包
-			err1 := c.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(2*time.Second))
+			err1 := c.conn.WriteControl(MessagePing, []byte{}, time.Now().Add(2*time.Second))
 			// 2. 同步發送應用層心跳 (供前端 JavaScript 秒級敏銳斷線感知)
 			c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-			err2 := c.conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"ping"}`))
+			err2 := c.conn.WriteMessage(MessageControl, []byte(`{"type":"ping"}`))
 			c.mu.Unlock()
 			if err1 != nil || err2 != nil {
 				return
@@ -178,10 +150,14 @@ func (c *Client) writePump(h *StreamHub) {
 
 // 串流中樞管理器 (支援多人協同、輸入租約鎖與雷射筆廣播)
 type StreamHub struct {
-	mu                   sync.Mutex
-	inputMu              sync.Mutex
-	streamMu             sync.Mutex
-	wsSlots              chan struct{}
+	done        chan struct{}
+	stopOnce    sync.Once
+	startOnce   sync.Once
+	stopWatcher func()
+	mu          sync.Mutex
+	inputMu     sync.Mutex
+	streamMu    sync.Mutex
+
 	lastRecovery         time.Time
 	lastControlBroadcast time.Time
 	lastLocalOverride    bool
@@ -193,7 +169,7 @@ type StreamHub struct {
 	requestKeyNext       bool
 	inputCtrl            remoteInput
 	authMgr              *auth.AuthManager
-	hostGUI              *gui.HostGUI
+	hostGUI              HostUI
 	currentController    *Client
 	controllerExpiry     time.Time
 }
@@ -222,8 +198,9 @@ func newStreamHub() (*StreamHub, error) {
 	inputCtrl := input.NewInputController()
 
 	hub := &StreamHub{
-		clients:        make(map[*Client]bool),
-		wsSlots:        make(chan struct{}, 64),
+		done:    make(chan struct{}),
+		clients: make(map[*Client]bool),
+
 		capEngine:      capEngine,
 		monitors:       monitors,
 		currentMonitor: primaryMonitor(monitors),
@@ -654,7 +631,12 @@ func (h *StreamHub) startStreamingLoop() {
 
 	var startTime = time.Now()
 
-	for range ticker.C {
+	for {
+		select {
+		case <-h.done:
+			return
+		case <-ticker.C:
+		}
 		h.streamMu.Lock()
 		// 只有在至少有一個客戶端連線時才抓取並壓縮，完全零無效負載！
 		h.mu.Lock()
@@ -712,293 +694,6 @@ func (h *StreamHub) startStreamingLoop() {
 	}
 }
 
-func main() {
-	// 全域未捕捉異常守護 (Panic Recovery)
-	defer func() {
-		if r := recover(); r != nil {
-			stackBuf := make([]byte, 4096)
-			n := runtime.Stack(stackBuf, false)
-			gui.ShowFatalError("NanoDesk - 系統致命錯誤 (Panic)",
-				"應用程式發生未預期的崩潰例外：\n\n%v\n\n【呼叫堆疊資訊】:\n%s",
-				r, string(stackBuf[:n]))
-		}
-	}()
-
-	var port int
-	var flagPwd string
-	bindIP := flag.String("bind", "", "監聽 IP（預設所有網卡；可設 127.0.0.1）")
-	modeHTTPS := flag.Bool("https", false, "啟用記憶體自簽 HTTPS 模式 (預設為純 HTTP 模式)")
-	flag.IntVar(&port, "port", 8080, "服務監聽埠號 (支援 --port 或 -port)")
-	flag.IntVar(&port, "p", 8080, "服務監聽埠號簡寫 (支援 -p 或 --p)")
-	flag.StringVar(&flagPwd, "pwd", "", "自訂全權限存取密碼 (支援英文字母、數字與特殊符號)")
-	flag.Parse()
-	addr := net.JoinHostPort(*bindIP, fmt.Sprint(port))
-
-	// 0. 外部依賴檢查：Windows Media Foundation (mfplat.dll / mfreadwrite.dll)
-	if err := encoder.CheckMediaFoundationAvailable(); err != nil {
-		gui.ShowFatalError("NanoDesk - 缺少系統媒體元件", "%v", err)
-		return
-	}
-
-	// 1. 外部通訊檢查：預先驗證網路通訊埠是否被佔用
-	testLn, err := net.Listen("tcp", addr)
-	if err != nil {
-		gui.ShowFatalError("NanoDesk - 通訊埠綁定失敗",
-			"無法監聽連接埠 %d：%v\n\n💡 可能原因：\n1. 該通訊埠已被其他程式（或前一次尚未完全結束的 NanoDesk）佔用。\n2. 防火牆或安全性原則阻止監聽。\n\n建議：請檢查工作管理員是否有殘留的 NanoDesk.exe，或在命令列加入 -port <其他埠號> 參數啟動。",
-			port, err)
-		return
-	}
-	testLn.Close()
-
-	ips := getLocalIPs()
-	if *bindIP != "" {
-		ips = []string{*bindIP}
-	}
-	primaryIP := "localhost"
-	if len(ips) > 0 {
-		primaryIP = ips[len(ips)-1]
-	}
-	serverProtocol := "http"
-	if *modeHTTPS {
-		serverProtocol = "https"
-	}
-	serverURL := fmt.Sprintf("%s://%s:%d", serverProtocol, primaryIP, port)
-
-	// 2. 建立串流中樞 (DXGI / GDI 畫面擷取 + 螢幕檢測 + H.264 編碼器)
-	hub, err := newStreamHub()
-	if err != nil {
-		gui.ShowFatalError("NanoDesk - 畫面擷取引擎啟動失敗",
-			"無法初始化桌面畫面擷取引擎：\n%v\n\n💡 常見排錯提示：\n1. 若您是在 Windows Server / 雲端虛擬機 (EC2/Azure/GCP) 運行，伺服器可能處於無螢幕 (Headless) 狀態，或遠端桌面 (RDP) 處於鎖定/斷開狀態。\n2. 系統未安裝相容之顯示卡驅動程式或不支援 DirectX 11 / GDI 桌面複製。\n3. 請確認伺服器有連接螢幕、或啟用虛擬螢幕 (Virtual Display Adapter)。",
-			err)
-		return
-	}
-	defer hub.capEngine.Close()
-
-	// 2. 初始化三級權限與雙軌審核安全管理器
-	var hostGUI *gui.HostGUI
-	authMgr := auth.NewAuthManager(func(req *auth.AuthRequest) {
-		if hostGUI != nil {
-			hostGUI.ShowAuthPrompt(req)
-		}
-	})
-
-	// 載入本地設定檔 (config.json) 中的自訂密碼
-	appCfg := config.LoadConfig()
-	if appCfg.LoadError != nil {
-		gui.ShowFatalError("設定檔錯誤", "%v", appCfg.LoadError)
-		return
-	}
-	uploadGiB := appCfg.UploadLimitGiB
-	if uploadGiB == 0 {
-		uploadGiB = 1
-	} // Settings written before this option existed.
-	limit, limitErr := uploadLimitBytes(uploadGiB)
-	if limitErr != nil {
-		gui.ShowFatalError("傳輸大小設定錯誤", "%v", limitErr)
-		return
-	}
-	maxUploadBytes.Store(limit)
-	if flagPwd != "" {
-		// 若透過命令列指定，直接套用全權限密碼
-		if err := authMgr.SetPassword(auth.RoleAdmin, flagPwd); err != nil {
-			gui.ShowFatalError("密碼設定失敗", "%v", err)
-			return
-		}
-	} else if appCfg.RememberPasswords && appCfg.Loaded {
-		// 載入已儲存之自訂密碼 (支援英數字及各類特殊符號)
-		if err := authMgr.ApplyPasswords(appCfg.ViewPassword, appCfg.StandardPassword, appCfg.AdminPassword); err != nil {
-			gui.ShowFatalError("密碼設定失敗", "%v", err)
-			return
-		}
-	}
-	hub.authMgr = authMgr
-
-	// 3. 啟動被控端純 Win32 原生管理 GUI (零體積膨脹，AnyDesk 原生質感)
-	serverURLs := []string{serverURL}
-	for _, ip := range ips {
-		url := fmt.Sprintf("%s://%s:%d", serverProtocol, ip, port)
-		if url != serverURL {
-			serverURLs = append(serverURLs, url)
-		}
-	}
-	serverURLs = append(serverURLs, fmt.Sprintf("%s://localhost:%d", serverProtocol, port))
-	hostGUI = gui.StartHostGUI(authMgr, serverURLs, func() {
-		hub.kickAllClients()
-	}, func() { go hub.recoverCapture() }, gui.UploadSettings{
-		GiB: uploadGiB,
-		Apply: func(gib int64) error {
-			limit, err := uploadLimitBytes(gib)
-			if err != nil {
-				return err
-			}
-			cfg := config.LoadConfig()
-			if cfg.LoadError != nil {
-				return cfg.LoadError
-			}
-			// Saving just the upload setting must preserve random passwords on next startup.
-			if !cfg.Loaded {
-				cfg.RememberPasswords = false
-			}
-			cfg.UploadLimitGiB = gib
-			if err := config.SaveConfig(cfg); err != nil {
-				return err
-			}
-			maxUploadBytes.Store(limit)
-			hub.broadcastUploadLimit()
-			return nil
-		},
-	})
-	hub.hostGUI = hostGUI
-
-	// 啟動背景推流工作協程
-	go hub.startStreamingLoop()
-
-	// 啟動剪貼簿自動變動偵測 (支援文字與圖片即時感知，自動廣播給所有連線客戶端)
-	clipboard.StartWatcher(300*time.Millisecond,
-		func(text string) {
-			hub.broadcastClipboard(text)
-		},
-		func(imgBytes []byte) {
-			hub.broadcastClipboardImage(imgBytes)
-		},
-		func() bool {
-			hub.mu.Lock()
-			defer hub.mu.Unlock()
-			return hub.currentController != nil && hub.clipboardAllowedLocked(hub.currentController)
-		},
-	)
-
-	// 4. 配置內嵌靜態資源 HTTP 路由
-	webSubFS, err := fs.Sub(embeddedWebFS, "web")
-	if err != nil {
-		gui.ShowFatalError("NanoDesk - 內嵌靜態資源解析失敗", "無法載入前端 Web 靜態資源目錄：%v", err)
-		return
-	}
-	http.Handle("/", http.FileServer(http.FS(webSubFS)))
-
-	// 認證 API 1: 密碼登入驗證端點 (根據不同密碼自動核發不同等級 Role 與 Token)
-	http.HandleFunc("/api/auth/login", hub.handleLogin)
-	// 認證 API 2: 請求被控端許可核准端點 (遠端在沒有密碼時點擊「發送連線請求」)
-	http.HandleFunc("/api/auth/request", hub.handleAuthRequest)
-	// 認證 API 3: 輪詢被控端審核狀態端點
-	http.HandleFunc("/api/auth/status", hub.handleAuthStatus)
-	// 檔案拖曳上傳端點 (需具備 RoleStandard 以上權限)
-	// 具備防中斷、防丟包之原子寫入機制，避免殘留損壞檔案
-	http.HandleFunc("/upload", hub.handleUpload)
-
-	// 5. 配置 WebSocket 連線端點 (具備身分權限驗證與 Ping/Pong 心跳保活)
-	http.HandleFunc("/ws", hub.handleWebSocket)
-	if *modeHTTPS {
-		// HTTPS 模式
-		cert, err := generateMemoryCertificate()
-		if err != nil {
-			gui.ShowFatalError("NanoDesk - TLS 憑證生成失敗", "無法生成記憶體自簽 TLS 憑證：%v", err)
-			return
-		}
-
-		server := &http.Server{
-			Addr: addr, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, Handler: secureHandler(http.DefaultServeMux),
-			TLSConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12,
-			},
-		}
-
-		fmt.Printf("🔒 已啟動【HTTPS 加密模式】\n")
-		fmt.Printf("👉 本機請開啟: https://localhost:%d\n", port)
-		for _, ip := range ips {
-			fmt.Printf("👉 測試筆電請開啟: https://%s:%d\n", ip, port)
-		}
-		fmt.Println("\n按下 Ctrl+C 可停止服務。")
-
-		if err := server.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
-			gui.ShowFatalError("NanoDesk - HTTPS 服務異常中止", "HTTPS 伺服器監聽發生錯誤：%v", err)
-		}
-	} else {
-		// 預設：純 HTTP 模式 (零憑證警告，雙軌解碼自適應)
-		fmt.Printf("🌐 已啟動【純 HTTP 模式】(雙軌解碼：WebCodecs / MSE 自適應)\n")
-		fmt.Printf("👉 本機瀏覽器請開: http://localhost:%d\n", port)
-		for _, ip := range ips {
-			fmt.Printf("👉 局域網其他電腦/筆電請開: http://%s:%d\n", ip, port)
-		}
-		fmt.Println("✨ 免裝憑證、免開 HTTPS、開箱即用！")
-		fmt.Println("\n按下 Ctrl+C 可停止服務。")
-
-		if err := (&http.Server{Addr: addr, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second, Handler: secureHandler(http.DefaultServeMux)}).ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			gui.ShowFatalError("NanoDesk - HTTP 服務異常中止", "HTTP 伺服器監聽發生錯誤：%v", err)
-		}
-	}
-}
-
-// 取得本機所有非回環之 IPv4 網卡地址
-func getLocalIPs() []string {
-	var ips []string
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return ips
-	}
-	for _, a := range addrs {
-		if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ip4 := ipnet.IP.To4(); ip4 != nil {
-				ips = append(ips, ip4.String())
-			}
-		}
-	}
-	return ips
-}
-
-// generateMemoryCertificate 在記憶體中動態生成自簽 TLS 憑證 (零檔案生成，零外部相依)
-func generateMemoryCertificate() (tls.Certificate, error) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	notBefore := time.Now().Add(-1 * time.Hour)
-	notAfter := notBefore.Add(365 * 24 * time.Hour) // 有效期 1 年
-
-	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			Organization: []string{"NanoDesk"},
-			CommonName:   "NanoDesk Host",
-		},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              []string{"localhost"},
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
-	}
-
-	// 自動將本機所有網卡 IP 填入證書主體別名 (SAN)
-	for _, ipStr := range getLocalIPs() {
-		if parsed := net.ParseIP(ipStr); parsed != nil {
-			template.IPAddresses = append(template.IPAddresses, parsed)
-		}
-	}
-
-	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
-	privBytes, err := x509.MarshalECPrivateKey(priv)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: privBytes})
-
-	return tls.X509KeyPair(certPEM, keyPEM)
-}
-
 // 處理客戶端傳遞的鍵鼠與控制指令 (嚴格遵循三級權限模型)
 func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 	h.inputMu.Lock()
@@ -1054,6 +749,13 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 
 	// 2. 根據客戶端當前授權之角色 (Role) 實施嚴格功能過濾與多人租約仲裁
 	switch cmdType {
+	case "laser_move":
+		x, okX := cmd["x"].(float64)
+		y, okY := cmd["y"].(float64)
+		if okX && okY && x >= 0 && x <= 1 && y >= 0 && y <= 1 {
+			h.broadcastLaser(client, x, y)
+		}
+		return
 	case "mouse_move":
 		if role < auth.RoleStandard {
 			return // 僅觀看者禁止滑鼠移動

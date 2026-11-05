@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"kvm/capture"
+	"kvm/core/capture"
 )
 
 // 儲存 32-bit BGRA 像素為標準 BMP 圖檔供人工確認

@@ -1,16 +1,14 @@
-package main
+package transport
 
 import (
 	"encoding/json"
-	"fmt"
-	"kvm/auth"
+	"github.com/gorilla/websocket"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"time"
 )
 
-func (h *StreamHub) handleLogin(w http.ResponseWriter, r *http.Request) {
+func (h *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
@@ -51,7 +49,7 @@ func (h *StreamHub) handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *StreamHub) handleAuthRequest(w http.ResponseWriter, r *http.Request) {
+func (h *Server) handleAuthRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
@@ -72,7 +70,7 @@ func (h *StreamHub) handleAuthRequest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *StreamHub) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+func (h *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", 405)
 		return
@@ -100,7 +98,7 @@ func (h *StreamHub) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *StreamHub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+func (h *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	select {
 	case h.wsSlots <- struct{}{}:
 		defer func() { <-h.wsSlots }()
@@ -113,53 +111,15 @@ func (h *StreamHub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Credentials travel in the first WebSocket message, never in a URL.
-	token := ""
-	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
+	clientIP := requestIP(r)
+	client, err := h.hub.AttachConnection(conn, clientIP, "", 10*time.Second, true)
+	if err != nil {
+		conn.Close()
+		return
 	}
-
-	seq := atomic.AddUint64(&clientSeq, 1)
-	color := userColors[(seq-1)%uint64(len(userColors))]
-	clientID := fmt.Sprintf("C%d", seq)
-	shortIP := clientIP
-	if len(shortIP) > 15 {
-		shortIP = shortIP[:15]
-	}
-	defaultName := fmt.Sprintf("成員-%d (%s)", seq, shortIP)
-
-	client := &Client{
-		conn:      conn,
-		id:        clientID,
-		name:      defaultName,
-		color:     color,
-		ip:        clientIP,
-		token:     token,
-		role:      auth.RoleNone,
-		authed:    false,
-		connected: time.Now(),
-		sendChan:  make(chan []byte, 3),
-		jsonChan:  make(chan outboundMessage, 32), done: make(chan struct{}), needsKey: true, clipboardEnabled: true,
-	}
-
-	// 若已自帶合法 Token 則直接賦權
-	if token != "" {
-		if role, valid := h.authMgr.ValidateToken(token); valid {
-			client.role = role
-			client.authed = true
-		}
-	}
-
-	h.registerClient(client)
-
-	// 啟動專屬非阻塞寫入與 Ping 心跳協程
-	go client.writePump(h)
-
+	defer h.hub.Detach(client)
 	// 設定初始讀取逾時與 Pong 回應處理
-	h.mu.Lock()
-	authed := client.authed
-	h.mu.Unlock()
+	authed := h.hub.Authorized(client)
 	if authed {
 		conn.SetReadLimit(10 * 1024 * 1024)
 	} else {
@@ -175,12 +135,18 @@ func (h *StreamHub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
-			h.unregisterClient(client)
+			h.hub.Detach(client)
 			break
 		}
 
 		// 客戶端傳送任何指令時刷新讀取超時
 		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		h.handleClientCommand(client, msgBytes)
+		h.hub.Command(client, msgBytes)
 	}
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return sameOrigin(r)
+	},
 }
