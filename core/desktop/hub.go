@@ -31,24 +31,27 @@ var clientSeq uint64
 
 // Client 客戶端連線結構 (具備獨立存取權限、身分 Token 與多人協同狀態)
 type Client struct {
-	conn             Transport
-	mu               sync.Mutex
-	id               string
-	name             string
-	color            string
-	ip               string
-	token            string
-	role             auth.Role
-	authed           bool
-	connected        time.Time
-	approvalWindow   time.Duration
-	sendChan         chan []byte // 視訊畫面封包非阻塞緩衝管道 (容量 10 幀)
-	closeOnce        sync.Once
-	jsonChan         chan outboundMessage
-	done             chan struct{}
-	queueMu          sync.Mutex
-	needsKey         bool
-	clipboardEnabled bool
+	conn                Transport
+	mu                  sync.Mutex
+	id                  string
+	name                string
+	color               string
+	ip                  string
+	token               string
+	role                auth.Role
+	authed              bool
+	connected           time.Time
+	approvalWindow      time.Duration
+	sendChan            chan []byte // 視訊畫面封包非阻塞緩衝管道 (容量 10 幀)
+	closeOnce           sync.Once
+	jsonChan            chan outboundMessage
+	done                chan struct{}
+	queueMu             sync.Mutex
+	needsKey            bool
+	clipboardEnabled    bool
+	clipboardBatch      bool
+	clipboardSequence   uint32
+	clipboardGeneration uint64
 }
 
 // 安全發送 JSON 控制文字訊息 (獨立逾時保護，不阻塞其他協程)
@@ -90,7 +93,7 @@ func (c *Client) writePump(h *StreamHub) {
 		case <-c.done:
 			return
 		case message := <-c.jsonChan:
-			if message.private && !h.clipboardAllowed(c) {
+			if message.private && !h.clipboardDeliveryAllowed(c) {
 				continue
 			}
 			h.mu.Lock()
@@ -171,6 +174,8 @@ type StreamHub struct {
 	authMgr              *auth.AuthManager
 	hostGUI              HostUI
 	currentController    *Client
+	nativeClipboardMu    sync.Mutex
+	sharedClipboard      sharedNativeClipboard
 	controllerExpiry     time.Time
 }
 
@@ -592,7 +597,7 @@ func (h *StreamHub) broadcastClipboard(text string) {
 	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if h.clipboardAllowedLocked(c) {
+		if h.clipboardAllowedLocked(c) && !c.clipboardBatch {
 			clients = append(clients, c)
 		}
 	}
@@ -613,7 +618,7 @@ func (h *StreamHub) broadcastClipboardImage(pngBytes []byte) {
 	h.mu.Lock()
 	clients := make([]*Client, 0, len(h.clients))
 	for c := range h.clients {
-		if h.clipboardAllowedLocked(c) {
+		if h.clipboardAllowedLocked(c) && !c.clipboardBatch {
 			clients = append(clients, c)
 		}
 	}
@@ -860,6 +865,9 @@ func (h *StreamHub) handleClientCommand(client *Client, msgBytes []byte) {
 	case "clipboard_auto":
 		if enabled, ok := cmd["enabled"].(bool); ok {
 			h.mu.Lock()
+			if client.clipboardEnabled != enabled {
+				client.clipboardGeneration++
+			}
 			client.clipboardEnabled = enabled
 			h.mu.Unlock()
 		}

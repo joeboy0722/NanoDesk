@@ -61,6 +61,7 @@ func NewHost(mgr *auth.AuthManager, ui HostUI) (*StreamHub, error) {
 func (h *StreamHub) Start() {
 	h.startOnce.Do(func() {
 		go h.startStreamingLoop()
+		go h.watchNativeClipboard()
 		h.stopWatcher = clipboard.StartWatcher(300*time.Millisecond, h.broadcastClipboard, h.broadcastClipboardImage, func() bool {
 			h.mu.Lock()
 			defer h.mu.Unlock()

@@ -1873,7 +1873,7 @@ extern "C" int ND_Init() {
     auto dpi = (BOOL(WINAPI *)(HANDLE))GetProcAddress(user, "SetProcessDpiAwarenessContext");
     if (dpi)
         dpi((HANDLE)-2);
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(OleInitialize(nullptr))) return 0;
     if (FAILED(MFStartup(MF_VERSION)))
         return 0;
     INITCOMMONCONTROLSEX cc = {sizeof(cc), ICC_TAB_CLASSES | ICC_STANDARD_CLASSES};

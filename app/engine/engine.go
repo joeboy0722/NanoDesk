@@ -26,24 +26,26 @@ import (
 type Event struct {
 	Kind, Session, Text string
 	Data                []byte
+	Run                 func()
 }
 type Engine struct {
-	mu           sync.Mutex
-	state        *identity.State
-	conn         *websocket.Conn
-	write        sync.Mutex
-	peers        map[string]*Peer
-	mgr          *auth.AuthManager
-	host         atomic.Pointer[desktop.StreamHub]
-	Events       chan Event
-	ctx          context.Context
-	cancel       context.CancelFunc
-	generation   uint64
-	services     Services
-	videoMu      sync.Mutex
-	waitingKey   map[string]bool
-	keyRequested map[string]time.Time
-	Frames       chan Event
+	mu                 sync.Mutex
+	state              *identity.State
+	conn               *websocket.Conn
+	write              sync.Mutex
+	peers              map[string]*Peer
+	mgr                *auth.AuthManager
+	host               atomic.Pointer[desktop.StreamHub]
+	Events             chan Event
+	ctx                context.Context
+	cancel             context.CancelFunc
+	generation         uint64
+	services           Services
+	videoMu            sync.Mutex
+	waitingKey         map[string]bool
+	keyRequested       map[string]time.Time
+	Frames             chan Event
+	clipboardPublisher ClipboardPublisher
 }
 type Services struct {
 	HostFactory      func(*auth.AuthManager, desktop.HostUI) (*desktop.StreamHub, error)
@@ -69,6 +71,7 @@ type Peer struct {
 	remoteLimit   int64
 	lastChat      time.Time
 	lastChatSent  time.Time
+	clipFiles     clipboardFiles
 }
 
 func New(s *identity.State) (*Engine, error) {
@@ -464,6 +467,9 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 		p.file = file
 		p.mu.Unlock()
 		file.OnMessage(func(m webrtc.DataChannelMessage) {
+			if p.handleClipboardFile(m.Data) {
+				return
+			}
 			var ack fileMeta
 			if json.Unmarshal(m.Data, &ack) == nil {
 				select {
@@ -537,7 +543,11 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 				p.recv = &receiver{peer: p}
 				recv := p.recv
 				p.mu.Unlock()
-				d.OnMessage(func(m webrtc.DataChannelMessage) { recv.message(m.Data) })
+				d.OnMessage(func(m webrtc.DataChannelMessage) {
+					if !p.handleClipboardFile(m.Data) {
+						recv.message(m.Data)
+					}
+				})
 			}
 		})
 	}
@@ -789,7 +799,10 @@ func (p *Peer) handle(b []byte) {
 		}
 		return
 	}
-	e.host.Load().Command(c, b)
+	host := e.host.Load()
+	if !host.NativeClipboard(c, msg.Type, b) {
+		host.Command(c, b)
+	}
 }
 
 // Implement desktop.Transport without exposing the WebRTC library to Web builds.

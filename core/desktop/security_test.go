@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"kvm/core/auth"
 	"kvm/core/capture"
+	"kvm/core/clipboard"
 	"sync"
 	"testing"
 	"time"
@@ -162,4 +163,90 @@ func TestVideoQueueCloseRaceAndRecovery(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestNativeClipboardPermissionsIndependentOfControl(t *testing.T) {
+	h := testHub(t)
+	view := testClient(t, h, auth.RoleView)
+	first := testClient(t, h, auth.RoleStandard)
+	second := testClient(t, h, auth.RoleAdmin)
+	for _, c := range []*Client{view, first, second} {
+		h.NativeClipboard(c, "clipboard_batch_hello", nil)
+	}
+	if h.clipboardDeliveryAllowed(view) || !h.clipboardDeliveryAllowed(first) || !h.clipboardDeliveryAllowed(second) {
+		t.Fatal("clipboard permission did not follow roles without a controller")
+	}
+	h.mu.Lock()
+	generation := first.clipboardGeneration
+	h.mu.Unlock()
+	grant := h.clipboardGrant(first, generation)
+	h.tryAcquireControl(first)
+	h.tryAcquireControl(second)
+	h.releaseControl(second)
+	if !grant() {
+		t.Fatal("keyboard control handoff revoked a clipboard grant")
+	}
+	h.handleClientCommand(first, []byte(`{"type":"clipboard_auto","enabled":false}`))
+	h.handleClientCommand(first, []byte(`{"type":"clipboard_auto","enabled":true}`))
+	if grant() || !h.clipboardDeliveryAllowed(first) {
+		t.Fatal("re-enabling synchronization revived the old clipboard grant")
+	}
+}
+
+type clipboardTestTransport struct {
+	Transport
+	relay func(int, int64, []byte) (int, error)
+}
+
+func (*clipboardTestTransport) CaptureNativeClipboard(int64, func() bool) (clipboard.Snapshot, uint32, error) {
+	return clipboard.Snapshot{}, clipboard.GetSequenceNumber(), nil
+}
+func (*clipboardTestTransport) InstallNativeClipboard(_ clipboard.Snapshot, seq uint32, _ func() bool) (uint32, error) {
+	return seq, nil
+}
+func (*clipboardTestTransport) ReadNativeClipboardFile(_ string, _ int, _ int64, data []byte, allowed func() bool) (int, error) {
+	if !allowed() {
+		return 0, fmt.Errorf("revoked")
+	}
+	return copy(data, "hello"), nil
+}
+func (c *clipboardTestTransport) RelayNativeClipboardFiles(_ *clipboard.ClipboardManifest, _ func() bool, read func(int, int64, []byte) (int, error)) {
+	c.relay = read
+}
+
+func TestSharedNativeClipboardLatestCopyWins(t *testing.T) {
+	h := testHub(t)
+	a := testClient(t, h, auth.RoleStandard)
+	b := testClient(t, h, auth.RoleStandard)
+	viewer := testClient(t, h, auth.RoleView)
+	for _, c := range []*Client{a, b, viewer} {
+		c.conn = &clipboardTestTransport{}
+		h.NativeClipboard(c, "clipboard_batch_hello", nil)
+		if c != viewer {
+			<-c.jsonChan
+		}
+	}
+	copyA := []byte(`{"files":{"id":"0123456789abcdef0123456789abcdef","items":[{"name":"file.txt","size":5}]}}`)
+	h.NativeClipboard(a, "clipboard_batch", copyA)
+	h.publishSharedClipboard()
+	if len(a.jsonChan) != 0 || len(viewer.jsonChan) != 0 || len(b.jsonChan) != 1 {
+		t.Fatal("first copy did not reach exactly the other authorized client")
+	}
+	<-b.jsonChan
+	read := b.conn.(*clipboardTestTransport).relay
+	if read == nil {
+		t.Fatal("file offer was not relayed")
+	}
+	data := make([]byte, 5)
+	if n, err := read(0, 0, data); err != nil || n != 5 || string(data) != "hello" {
+		t.Fatalf("relayed read: %q, %d, %v", data, n, err)
+	}
+	h.NativeClipboard(b, "clipboard_batch", []byte(`{"batch":{"UnicodeText":"QgAAAA=="}}`))
+	h.publishSharedClipboard()
+	if len(a.jsonChan) != 1 || len(b.jsonChan) != 0 || len(viewer.jsonChan) != 0 {
+		t.Fatal("replacement did not reach exactly the other authorized client")
+	}
+	if _, err := read(0, 0, data); err == nil {
+		t.Fatal("replaced file offer still readable")
+	}
 }
