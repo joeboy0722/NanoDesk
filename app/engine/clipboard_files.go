@@ -158,6 +158,9 @@ func (p *Peer) readClipboardFile(id string, item int, offset int64, dst []byte, 
 		f.mu.Unlock()
 	}()
 
+	p.mu.Lock()
+	startGeneration := p.relayGeneration
+	p.mu.Unlock()
 	length := min(len(dst), clipboardChunkSize)
 	if err := p.sendClipboardFile(clipboardFileMessage{
 		Request: request, Offer: id, Item: item, Offset: offset, Length: length,
@@ -166,16 +169,36 @@ func (p *Peer) readClipboardFile(id string, item int, offset int64, dst []byte, 
 	}
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
-	select {
-	case m := <-reply:
-		if !allowed() || m.Failed || len(m.Data) != length {
-			return 0, fmt.Errorf("剪貼簿檔案讀取失敗")
+	poll := time.NewTicker(100 * time.Millisecond)
+	defer poll.Stop()
+	extended := false
+	for {
+		select {
+		case m := <-reply:
+			if !allowed() || m.Failed || len(m.Data) != length {
+				return 0, fmt.Errorf("剪貼簿檔案讀取失敗")
+			}
+			return copy(dst, m.Data), nil
+		case <-timer.C:
+			p.mu.Lock()
+			recovering := !p.closed && (p.relayRecovering || p.relayGeneration != startGeneration)
+			p.mu.Unlock()
+			if recovering && !extended {
+				extended = true
+				timer.Reset(15 * time.Second)
+				continue
+			}
+			return 0, fmt.Errorf("剪貼簿檔案讀取逾時")
+		case <-poll.C:
+			p.mu.Lock()
+			closed := p.closed
+			p.mu.Unlock()
+			if closed || !allowed() {
+				return 0, io.ErrClosedPipe
+			}
+		case <-p.engine.ctx.Done():
+			return 0, io.ErrClosedPipe
 		}
-		return copy(dst, m.Data), nil
-	case <-timer.C:
-		return 0, fmt.Errorf("剪貼簿檔案讀取逾時")
-	case <-p.engine.ctx.Done():
-		return 0, io.ErrClosedPipe
 	}
 }
 

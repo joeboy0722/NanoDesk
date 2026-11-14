@@ -7,18 +7,27 @@
 | `web/` | 現有控制台與內嵌網頁 | `NanoDesk-Web.exe` |
 | `app/` | 原生 Win32、H.264 解碼、Direct3D 顯示 | `NanoDesk-App.exe` |
 | `core/` | 擷取、編碼、輸入、授權、剪貼簿、身分及桌面工作階段 | 共用程式庫 |
-| `server/` | 固定 ID、連線協調、STUN／TURN 中繼 | `NanoDesk-Server.exe` |
+| `server/` | 固定 ID、連線協調、共用 UDP 埠池與 HTTPS TLS 中繼 | `NanoDesk-Server.exe` |
 
 原有 `NanoDesk.exe` 不由新建置覆寫。操作與部署分別見 [Web 說明](web/README.md)、[APP 說明](app/README.md)、[伺服器說明](server/README.md)。
 
-## 快速使用
+## 使用手冊與快速開始
 
-1. 雙擊 `NanoDesk-Server.exe`，在原生設定分頁填公網 IP、選取或建立憑證，按「儲存並啟動」；不需要 CLI。另須開放設定的連接埠。
-2. 雙方開啟 `NanoDesk-App.exe`，點右上角齒輪，在 APP 內的設定分頁填入 `https://伺服器主機名稱` 並儲存。
-3. 上線後顯示十位固定 ID；輸入對方 ID，選擇請求授權，或輸入已啟用的無人值守密碼。
-4. 遠端視窗使用圖示工具列，滑鼠停留顯示名稱與狀態；編號螢幕圖示直接切換螢幕。
+- [App 使用手冊](app/README.md) 包含首次連線、角色、多人／多主機、雙向剪貼簿、檔案傳輸與疑難排解。
+- [伺服器使用手冊](server/README.md) 包含憑證、端點池、多網卡、Port／NAT、容量、熱套用與備份。
+- [Web 使用說明](web/README.md) 適用於獨立的 Web 版本。
 
-無人值守預設關閉。身分與設定使用 Windows DPAPI 加密，存於 `%LOCALAPPDATA%\NanoDesk\state.bin`。APP 需持續開啟並處於可操作的互動桌面；不提供開機服務、登入畫面或 UAC 安全桌面控制。
+1. 開啟 `NanoDesk-Server.exe`，設定 App 可達的 IP／網域、相符的 TLS 憑證及 ID 資料庫。
+2. 啟用「中繼端點池」，設定本機綁定 IP、公布位址、UDP Port 及容量，向下捲動確認預設組及端點啟用，再儲存並啟動。
+3. 開放 HTTPS TCP 埠及端點池的 UDP Port。NAT 後方另需設定轉送。`127.0.0.1` 僅適合同機測試。
+4. 在兩端 App 的設定填入同一個 HTTPS 伺服器網址。自簽憑證需將公開 CA 檔帶到每台 App 電腦並指定本機路徑。
+5. 上線取得十位 ID，輸入對方 ID，使用人工核准或已啟用的角色密碼連線。
+
+App 與伺服器使用協定版本 2，需一起更新。原有 Release 可保留，新測試版本以 pre-release 提供。
+
+一般控制以上的連線可雙向同步文字、圖片及按需傳輸的檔案。同一被控桌面採最後複製者覆蓋的共用剪貼簿，與鍵鼠主控權分開。每個 App 最多維持 16 條連入／連出工作階段。
+
+無人值守預設關閉。App 身分與設定以 Windows DPAPI 加密，位於 `%LOCALAPPDATA%\NanoDesk\state.bin`。App 需持續執行並位於可操作的互動桌面。
 
 ## 建置與驗證
 

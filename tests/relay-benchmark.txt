@@ -1,0 +1,42 @@
+goos: windows
+goarch: amd64
+pkg: kvm/core/relay
+cpu: AMD Ryzen 5 5600 6-Core Processor
+BenchmarkRelayPorts/ports=1/payload=64/paced-12         	     117	   8611744 ns/op	   0.01 MB/s	         0 errors	         0.01380 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9628 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=1/payload=64/paced-12         	     118	   8534042 ns/op	   0.01 MB/s	         0 errors	         0.05306 mean-rtt-ms	         0.1293 process-cpu-percent	         0 queue-drops	    9546 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=1/payload=64/paced-12         	     118	   8533857 ns/op	   0.01 MB/s	         0 errors	         0.02067 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9537 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=1/payload=64/saturated-12     	   41317	     26880 ns/op	   4.76 MB/s	         0 errors	         0.3222 mean-rtt-ms	        33.53 process-cpu-percent	         0 queue-drops	    8643 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=1/payload=64/saturated-12     	   40617	     27203 ns/op	   4.71 MB/s	         0 errors	         0.3262 mean-rtt-ms	        33.11 process-cpu-percent	         0 queue-drops	    8642 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=1/payload=64/saturated-12     	   41114	     26086 ns/op	   4.91 MB/s	         0 errors	         0.3129 mean-rtt-ms	        33.14 process-cpu-percent	         0 queue-drops	    8642 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=1/payload=1200/paced-12       	     118	   8513028 ns/op	   0.28 MB/s	         0 errors	         0.01882 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14219 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=1/payload=1200/paced-12       	     118	   8535843 ns/op	   0.28 MB/s	         0 errors	         0.03538 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14223 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=1/payload=1200/paced-12       	     118	   8514394 ns/op	   0.28 MB/s	         0 errors	         0.02340 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14220 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=1/payload=1200/saturated-12   	   46312	     28449 ns/op	  84.36 MB/s	         0 errors	         0.3412 mean-rtt-ms	        33.60 process-cpu-percent	         0 queue-drops	   13251 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=1/payload=1200/saturated-12   	   41938	     28221 ns/op	  85.04 MB/s	         0 errors	         0.3386 mean-rtt-ms	        34.32 process-cpu-percent	         0 queue-drops	   13251 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=1/payload=1200/saturated-12   	   43542	     29074 ns/op	  82.55 MB/s	         0 errors	         0.3488 mean-rtt-ms	        35.28 process-cpu-percent	         0 queue-drops	   13251 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=2/payload=64/paced-12         	     118	   8527420 ns/op	   0.02 MB/s	         0 errors	         0.002827 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9488 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=2/payload=64/paced-12         	     118	   8505761 ns/op	   0.02 MB/s	         0 errors	         0.01867 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9490 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=2/payload=64/paced-12         	     118	   8550808 ns/op	   0.01 MB/s	         0 errors	         0.002519 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9489 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=2/payload=64/saturated-12     	   64548	     18317 ns/op	   6.99 MB/s	         0 errors	         0.2196 mean-rtt-ms	        52.42 process-cpu-percent	         0 queue-drops	    8642 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=2/payload=64/saturated-12     	   65202	     19196 ns/op	   6.67 MB/s	         0 errors	         0.2299 mean-rtt-ms	        53.06 process-cpu-percent	         0 queue-drops	    8642 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=2/payload=64/saturated-12     	   61796	     18072 ns/op	   7.08 MB/s	         0 errors	         0.2165 mean-rtt-ms	        49.90 process-cpu-percent	         0 queue-drops	    8642 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=2/payload=1200/paced-12       	     118	   8544147 ns/op	   0.28 MB/s	         0 errors	         0 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14266 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=2/payload=1200/paced-12       	     142	   8510556 ns/op	   0.28 MB/s	         0 errors	         0.02366 mean-rtt-ms	         0.5387 process-cpu-percent	         0 queue-drops	   14102 B/op	     121 allocs/op
+BenchmarkRelayPorts/ports=2/payload=1200/paced-12       	     141	   8575209 ns/op	   0.28 MB/s	         0 errors	         0.004813 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14109 B/op	     121 allocs/op
+BenchmarkRelayPorts/ports=2/payload=1200/saturated-12   	   59498	     20038 ns/op	 119.77 MB/s	         0 errors	         0.2397 mean-rtt-ms	        50.79 process-cpu-percent	         0 queue-drops	   13250 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=2/payload=1200/saturated-12   	   59095	     20617 ns/op	 116.41 MB/s	         0 errors	         0.2470 mean-rtt-ms	        48.84 process-cpu-percent	         0 queue-drops	   13250 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=2/payload=1200/saturated-12   	   57108	     21060 ns/op	 113.96 MB/s	         0 errors	         0.2523 mean-rtt-ms	        55.32 process-cpu-percent	         0 queue-drops	   13250 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=5/payload=64/paced-12         	     118	   8535905 ns/op	   0.01 MB/s	         0 errors	         0.007474 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9491 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=5/payload=64/paced-12         	     142	   8515072 ns/op	   0.02 MB/s	         0 errors	         0.001164 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9393 B/op	     121 allocs/op
+BenchmarkRelayPorts/ports=5/payload=64/paced-12         	     118	   8537679 ns/op	   0.01 MB/s	         0 errors	         0.05326 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	    9488 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=5/payload=64/saturated-12     	   68020	     18038 ns/op	   7.10 MB/s	         0 errors	         0.2158 mean-rtt-ms	        52.11 process-cpu-percent	         0 queue-drops	    8641 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=5/payload=64/saturated-12     	   68750	     17818 ns/op	   7.18 MB/s	         0 errors	         0.2130 mean-rtt-ms	        53.36 process-cpu-percent	         0 queue-drops	    8642 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=5/payload=64/saturated-12     	   69002	     18106 ns/op	   7.07 MB/s	         0 errors	         0.2166 mean-rtt-ms	        54.20 process-cpu-percent	         0 queue-drops	    8641 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=5/payload=1200/paced-12       	     118	   8550975 ns/op	   0.28 MB/s	         0 errors	         0.002393 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14234 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=5/payload=1200/paced-12       	     118	   8539340 ns/op	   0.28 MB/s	         0 errors	         0.001668 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14219 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=5/payload=1200/paced-12       	     118	   8533115 ns/op	   0.28 MB/s	         0 errors	         0.006100 mean-rtt-ms	         0 process-cpu-percent	         0 queue-drops	   14235 B/op	     123 allocs/op
+BenchmarkRelayPorts/ports=5/payload=1200/saturated-12   	   63240	     20836 ns/op	 115.19 MB/s	         0 errors	         0.2467 mean-rtt-ms	        52.97 process-cpu-percent	         0 queue-drops	   13250 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=5/payload=1200/saturated-12   	   61378	     19618 ns/op	 122.34 MB/s	         0 errors	         0.2345 mean-rtt-ms	        52.66 process-cpu-percent	         0 queue-drops	   13250 B/op	     108 allocs/op
+BenchmarkRelayPorts/ports=5/payload=1200/saturated-12   	   62012	     19362 ns/op	 123.95 MB/s	         0 errors	         0.2311 mean-rtt-ms	        55.41 process-cpu-percent	         0 queue-drops	   13250 B/op	     108 allocs/op
+PASS
+ok  	kvm/core/relay	52.230s

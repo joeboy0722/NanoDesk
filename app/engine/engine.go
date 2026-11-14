@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	pionice "github.com/pion/ice/v4"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
@@ -21,6 +22,7 @@ import (
 	"kvm/core/desktop"
 	"kvm/core/identity"
 	"kvm/core/protocol"
+	"kvm/core/relay"
 )
 
 type Event struct {
@@ -52,26 +54,31 @@ type Services struct {
 	ReceiveDirectory func() (string, error)
 }
 type Peer struct {
-	mu            sync.Mutex
-	sendMu        sync.Mutex
-	fragments     []byte
-	engine        *Engine
-	sid, id, ip   string
-	caller        bool
-	pc            *webrtc.PeerConnection
-	control, file *webrtc.DataChannel
-	track         *webrtc.TrackLocalStaticSample
-	client        *desktop.Client
-	closed        bool
-	once          sync.Once
-	recv          *receiver
-	sending       bool
-	fileCancel    chan struct{}
-	fileAck       chan fileMeta
-	remoteLimit   int64
-	lastChat      time.Time
-	lastChatSent  time.Time
-	clipFiles     clipboardFiles
+	relaySocket         *relay.SwitchConn
+	relayGeneration     uint64
+	relayRecovering     bool
+	relayRecoveryTicket uint64
+	relayMux            pionice.UDPMux
+	mu                  sync.Mutex
+	sendMu              sync.Mutex
+	fragments           []byte
+	engine              *Engine
+	sid, id, ip         string
+	caller              bool
+	pc                  *webrtc.PeerConnection
+	control, file       *webrtc.DataChannel
+	track               *webrtc.TrackLocalStaticSample
+	client              *desktop.Client
+	closed              bool
+	once                sync.Once
+	recv                *receiver
+	sending             bool
+	fileCancel          chan struct{}
+	fileAck             chan fileMeta
+	remoteLimit         int64
+	lastChat            time.Time
+	lastChatSent        time.Time
+	clipFiles           clipboardFiles
 }
 
 func New(s *identity.State) (*Engine, error) {
@@ -221,11 +228,11 @@ func (e *Engine) run(s identity.Settings) error {
 	if err = c.ReadJSON(&m); err != nil {
 		return err
 	}
-	if m.Type != "challenge" || m.Version != 1 || len(m.Nonce) != 32 {
+	if m.Type != "challenge" || m.Version != protocol.Version || len(m.Nonce) != 32 {
 		return fmt.Errorf("伺服器協定不相容")
 	}
 	public := e.state.Private.Public().(ed25519.PublicKey)
-	if err = c.WriteJSON(protocol.Signal{Type: "register", Version: 1, Public: public, Signature: ed25519.Sign(e.state.Private, protocol.Proof(m.Nonce))}); err != nil {
+	if err = c.WriteJSON(protocol.Signal{Type: "register", Version: protocol.Version, Public: public, Signature: ed25519.Sign(e.state.Private, protocol.Proof(m.Nonce))}); err != nil {
 		return err
 	}
 	if err = c.ReadJSON(&m); err != nil {
@@ -258,6 +265,7 @@ func (e *Engine) run(s identity.Settings) error {
 		e.mu.Unlock()
 		e.DisconnectAll()
 	}()
+	pendingRelay := make(map[string]protocol.Signal)
 	for {
 		c.SetReadDeadline(time.Now().Add(60 * time.Second))
 		if err = c.ReadJSON(&m); err != nil {
@@ -269,12 +277,80 @@ func (e *Engine) run(s identity.Settings) error {
 		case "error":
 			e.emit(Event{Kind: "signal_error", Text: m.Error})
 		case "session":
+			if m.RelayEnabled {
+				pendingRelay[m.Session] = m
+				e.signal(protocol.Signal{Type: "relay_candidates", Session: m.Session})
+				continue
+			}
 			if err = e.newPeer(m); err != nil {
 				if m.Caller {
 					e.emit(Event{Kind: "connect_error", Session: m.Target, Text: err.Error()})
 				} else {
 					e.emit(Event{Kind: "error", Text: err.Error()})
 				}
+				e.signal(protocol.Signal{Type: "close", Session: m.Session})
+			}
+		case "relay_candidates", "relay_refresh":
+			generation := uint64(1)
+			if m.Type == "relay_refresh" {
+				p := e.get(m.Session)
+				if p == nil {
+					continue
+				}
+				p.mu.Lock()
+				fresh := m.RelayGeneration > p.relayGeneration && !p.closed
+				if fresh {
+					p.relayRecovering = true
+				}
+				p.mu.Unlock()
+				if !fresh {
+					continue
+				}
+				e.armRelayRecovery(p)
+				generation = m.RelayGeneration
+			}
+			if _, ok := pendingRelay[m.Session]; !ok && e.get(m.Session) == nil {
+				continue
+			}
+			if e.Settings().RelayTLSOnly {
+				var available []string
+				for _, candidate := range m.RelayCandidates {
+					available = append(available, candidate.BindAddress)
+				}
+				e.signal(protocol.Signal{Type: "relay_allocate", Session: m.Session, RelayReachable: available, RelayTLS: true, RelayGeneration: generation})
+			} else {
+				go e.probeRelayCandidates(m.Session, m.RelayCandidates, generation)
+			}
+		case "relay_ready":
+			if p := e.get(m.Session); p != nil && m.RelayPath != nil {
+				if err := p.replaceRelay(m.RelayPath); err != nil {
+					e.emit(Event{Kind: "peer_status", Session: m.Session, Text: err.Error()})
+				}
+				continue
+			}
+			initial, ok := pendingRelay[m.Session]
+			if !ok {
+				continue
+			}
+			delete(pendingRelay, m.Session)
+			initial.RelayPath = m.RelayPath
+			if initial.RelayPath == nil {
+				continue
+			}
+			if err := e.newPeer(initial); err != nil {
+				e.emit(Event{Kind: "connect_error", Session: initial.Target, Text: err.Error()})
+				e.signal(protocol.Signal{Type: "close", Session: m.Session})
+			}
+		case "relay_failed":
+			if initial, ok := pendingRelay[m.Session]; ok {
+				delete(pendingRelay, m.Session)
+				settings := e.Settings()
+				if !settings.RelayOnly && !settings.RelayTLSOnly {
+					if err := e.newPeer(initial); err == nil {
+						continue
+					}
+				}
+				e.emit(Event{Kind: "connect_error", Session: initial.Target, Text: m.Error})
 				e.signal(protocol.Signal{Type: "close", Session: m.Session})
 			}
 		case "offer", "answer":
@@ -288,6 +364,7 @@ func (e *Engine) run(s identity.Settings) error {
 				}(m)
 			}
 		case "close":
+			delete(pendingRelay, m.Session)
 			if p := e.get(m.Session); p != nil {
 				p.Close()
 			}
@@ -412,15 +489,33 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 	if err != nil {
 		return err
 	}
+	var relayMux pionice.UDPMux
+	var relaySocket *relay.SwitchConn
+	if m.RelayPath != nil {
+		api, relayMux, relaySocket, err = relayPeerAPI(m.RelayPath, m.Caller, settings, func() { e.recoverRelay(m.Session) })
+		if err != nil {
+			return err
+		}
+		ice = nil
+		if !settings.RelayOnly && !settings.RelayTLSOnly && !m.RelayPath.TLS {
+			ice = []webrtc.ICEServer{{URLs: []string{"stun:" + m.RelayPath.Address}}}
+		}
+	}
 	policy := webrtc.ICETransportPolicyAll
-	if settings.RelayOnly || settings.RelayTLSOnly {
+	if m.RelayPath == nil && (settings.RelayOnly || settings.RelayTLSOnly) {
 		policy = webrtc.ICETransportPolicyRelay
 	}
 	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: ice, ICETransportPolicy: policy})
 	if err != nil {
+		if relayMux != nil {
+			relayMux.Close()
+		}
 		return err
 	}
-	p := &Peer{engine: e, sid: m.Session, id: m.Target, ip: m.IP, caller: m.Caller, pc: pc, fileAck: make(chan fileMeta, 8)}
+	p := &Peer{relaySocket: relaySocket, relayMux: relayMux, engine: e, sid: m.Session, id: m.Target, ip: m.IP, caller: m.Caller, pc: pc, fileAck: make(chan fileMeta, 8)}
+	if m.RelayPath != nil {
+		p.relayGeneration = m.RelayPath.Credentials.Generation
+	}
 	e.mu.Lock()
 	e.peers[m.Session] = p
 	e.mu.Unlock()
@@ -435,7 +530,7 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 			for _, v := range stats {
 				if pair, ok := v.(webrtc.ICECandidatePairStats); ok && pair.Nominated {
 					for _, id := range []string{pair.LocalCandidateID, pair.RemoteCandidateID} {
-						if c, ok := stats[id].(webrtc.ICECandidateStats); ok && c.CandidateType == webrtc.ICECandidateTypeRelay {
+						if c, ok := stats[id].(webrtc.ICECandidateStats); ok && (c.CandidateType == webrtc.ICECandidateTypeRelay || c.IP == "198.18.0.1" || c.IP == "198.18.0.2") {
 							kind = "中繼"
 						}
 					}
@@ -572,7 +667,11 @@ func (p *Peer) local(d webrtc.SessionDescription, kind string) error {
 	case <-p.engine.ctx.Done():
 		return context.Canceled
 	}
-	return p.engine.signal(protocol.Signal{Type: kind, Session: p.sid, SDP: p.pc.LocalDescription().SDP})
+	sdp := p.pc.LocalDescription().SDP
+	if p.relayMux != nil {
+		sdp = relayCandidatePriority(sdp)
+	}
+	return p.engine.signal(protocol.Signal{Type: kind, Session: p.sid, SDP: sdp})
 }
 func (p *Peer) description(m protocol.Signal) error {
 	kind := webrtc.SDPTypeAnswer
@@ -853,6 +952,9 @@ func (p *Peer) Close() error {
 		}
 		p.engine.signal(protocol.Signal{Type: "close", Session: p.sid})
 		p.pc.Close()
+		if p.relayMux != nil {
+			p.relayMux.Close()
+		}
 		if c != nil && p.engine.host.Load() != nil {
 			p.engine.host.Load().Detach(c)
 		}

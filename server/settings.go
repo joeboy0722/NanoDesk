@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"kvm/core/relay"
 	"net"
 	"os"
 	"path/filepath"
@@ -10,20 +11,23 @@ import (
 )
 
 type serverSettings struct {
-	PublicIP    string `json:"public_ip"`
-	Host        string `json:"host"`
-	ListenIP    string `json:"listen_ip"`
-	HTTPSPort   int    `json:"https_port"`
-	TURNPort    int    `json:"turn_port"`
-	TURNTLSPort int    `json:"turn_tls_port"`
-	RelayMin    int    `json:"relay_min"`
-	RelayMax    int    `json:"relay_max"`
-	RelayMbps   int    `json:"relay_mbps"`
-	Certificate string `json:"certificate"`
-	PrivateKey  string `json:"private_key"`
-	CAFile      string `json:"ca_file,omitempty"`
-	Database    string `json:"database"`
-	AutoStart   bool   `json:"auto_start"`
+	SchemaVersion    int           `json:"schema_version"`
+	MigrationPending bool          `json:"migration_pending,omitempty"`
+	RelayPool        *relay.Config `json:"relay_pool,omitempty"`
+	PublicIP         string        `json:"public_ip"`
+	Host             string        `json:"host"`
+	ListenIP         string        `json:"listen_ip"`
+	HTTPSPort        int           `json:"https_port"`
+	TURNPort         int           `json:"turn_port"`
+	TURNTLSPort      int           `json:"turn_tls_port"`
+	RelayMin         int           `json:"relay_min"`
+	RelayMax         int           `json:"relay_max"`
+	RelayMbps        int           `json:"relay_mbps"`
+	Certificate      string        `json:"certificate"`
+	PrivateKey       string        `json:"private_key"`
+	CAFile           string        `json:"ca_file,omitempty"`
+	Database         string        `json:"database"`
+	AutoStart        bool          `json:"auto_start"`
 }
 
 func settingsPath() (string, error) {
@@ -45,7 +49,7 @@ func defaults(base string) serverSettings {
 	if info, e := os.Stat(legacy); e == nil && info.Mode().IsRegular() {
 		db = legacy
 	}
-	return serverSettings{ListenIP: "0.0.0.0", HTTPSPort: 443, TURNPort: 3478, TURNTLSPort: 5349, RelayMin: 49160, RelayMax: 49260, RelayMbps: 20, Certificate: filepath.Join(exeDir, "server.crt"), PrivateKey: filepath.Join(exeDir, "server.key"), Database: db}
+	return serverSettings{SchemaVersion: 2, ListenIP: "0.0.0.0", HTTPSPort: 443, TURNPort: 3478, TURNTLSPort: 5349, RelayMin: 49160, RelayMax: 49260, RelayMbps: 20, Certificate: filepath.Join(exeDir, "server.crt"), PrivateKey: filepath.Join(exeDir, "server.key"), Database: db}
 }
 func loadSettings(path string) (serverSettings, error) {
 	s := defaults(filepath.Dir(path))
@@ -58,6 +62,18 @@ func loadSettings(path string) (serverSettings, error) {
 	}
 	if err = json.Unmarshal(b, &s); err != nil {
 		return s, fmt.Errorf("設定檔無法解析，請先保留備份：%w", err)
+	}
+	var schema struct {
+		Version int `json:"schema_version"`
+	}
+	if err := json.Unmarshal(b, &schema); err != nil {
+		return s, err
+	}
+	if schema.Version > 2 {
+		return s, fmt.Errorf("伺服器設定檔版本過新")
+	}
+	if schema.Version < 2 {
+		return migrateRelaySettings(path, b, s)
 	}
 	return s.resolved(filepath.Dir(path)), nil
 }
@@ -86,29 +102,40 @@ func (s serverSettings) validateEndpoint() error {
 }
 
 func (s serverSettings) validate() error {
+	if s.RelayPool != nil {
+		if err := s.RelayPool.Validate(); err != nil {
+			return fmt.Errorf("中繼端點設定無效: %w", err)
+		}
+	}
 	if err := s.validateEndpoint(); err != nil {
 		return err
 	}
-	if net.ParseIP(s.ListenIP).To4() == nil {
+	if net.ParseIP(s.ListenIP) == nil || s.RelayPool == nil && net.ParseIP(s.ListenIP).To4() == nil {
 		return fmt.Errorf("監聽 IP 必須是 IPv4；所有網卡請填 0.0.0.0")
 	}
-	for _, p := range []int{s.HTTPSPort, s.TURNPort, s.TURNTLSPort} {
-		if p < 1 || p > 65535 {
-			return fmt.Errorf("連接埠必須介於 1 至 65535")
+	if s.HTTPSPort < 1 || s.HTTPSPort > 65535 {
+		return fmt.Errorf("HTTPS 埠需介於 1 至 65535")
+	}
+	if s.RelayPool == nil {
+		for _, p := range []int{s.HTTPSPort, s.TURNPort, s.TURNTLSPort} {
+			if p < 1 || p > 65535 {
+				return fmt.Errorf("連接埠必須介於 1 至 65535")
+			}
+		}
+		if s.HTTPSPort == s.TURNTLSPort {
+			return fmt.Errorf("HTTPS 與 TURN TLS 不可使用相同 TCP 埠")
+		}
+		if s.RelayMin < 1024 || s.RelayMax >= 65535 || s.RelayMax < s.RelayMin {
+			return fmt.Errorf("中繼 UDP 範圍需介於 1024 至 65534，且起始值不可大於結束值")
+		}
+		if s.TURNPort >= s.RelayMin && s.TURNPort <= s.RelayMax {
+			return fmt.Errorf("TURN UDP 埠不可落在中繼配置範圍內")
+		}
+		if s.RelayMbps < 1 || s.RelayMbps > 1000 {
+			return fmt.Errorf("中繼頻寬需介於 1 至 1000 Mbit/s")
 		}
 	}
-	if s.HTTPSPort == s.TURNTLSPort {
-		return fmt.Errorf("HTTPS 與 TURN TLS 不可使用相同 TCP 埠")
-	}
-	if s.RelayMin < 1024 || s.RelayMax >= 65535 || s.RelayMax < s.RelayMin {
-		return fmt.Errorf("中繼 UDP 範圍需介於 1024 至 65534，且起始值不可大於結束值")
-	}
-	if s.TURNPort >= s.RelayMin && s.TURNPort <= s.RelayMax {
-		return fmt.Errorf("TURN UDP 埠不可落在中繼配置範圍內")
-	}
-	if s.RelayMbps < 1 || s.RelayMbps > 1000 {
-		return fmt.Errorf("中繼頻寬需介於 1 至 1000 Mbit/s")
-	}
+
 	if s.Certificate == "" || s.PrivateKey == "" {
 		return fmt.Errorf("請選擇 TLS 憑證與私鑰，或按「建立自簽憑證」")
 	}
@@ -119,6 +146,7 @@ func (s serverSettings) validate() error {
 }
 func saveSettings(path string, s serverSettings) error {
 	s = s.resolved(filepath.Dir(path))
+	s.SchemaVersion = 2
 	if err := s.validate(); err != nil {
 		return err
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"kvm/core/relay"
 	"log"
 	"path/filepath"
 	"runtime"
@@ -38,6 +39,7 @@ func (b *logBuffer) Write(p []byte) (int, error) {
 func (b *logBuffer) Text() string { b.mu.Lock(); defer b.mu.Unlock(); return b.text }
 
 type serverSnapshot struct {
+	RelaySockets             []relay.SocketStats
 	Phase, Error             string
 	Online, Sessions, Relays int
 }
@@ -63,7 +65,15 @@ func (c *serverController) Snapshot() serverSnapshot {
 		s.Online = len(h.online)
 		s.Sessions = len(h.links)
 		h.mu.Unlock()
-		s.Relays = len(c.active.generator.slots)
+		if c.active.generator != nil {
+			s.Relays = len(c.active.generator.slots)
+		}
+		if h.relayPool != nil {
+			s.RelaySockets = h.relayPool.Stats()
+			for _, socket := range s.RelaySockets {
+				s.Relays += int(socket.Reservations)
+			}
+		}
 	}
 	return s
 }
@@ -143,4 +153,22 @@ func (c *serverController) Backup(source, destination string) error {
 		return active.Backup(destination)
 	}
 	return backupStoppedDatabase(source, destination)
+}
+
+func (c *serverController) ApplyRelaySettings(path string, settings serverSettings) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != "running" || c.active == nil {
+		return fmt.Errorf("服務未運作")
+	}
+	return c.active.ApplyRelaySettings(path, settings)
+}
+
+func (c *serverController) DisableRelayEndpoint(path, id string) (serverSettings, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.phase != "running" || c.active == nil {
+		return serverSettings{}, fmt.Errorf("服務未運作")
+	}
+	return c.active.DisableRelayEndpoint(path, id)
 }

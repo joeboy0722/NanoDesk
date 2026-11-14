@@ -59,7 +59,18 @@ func controlOfType(t *testing.T, e *engine.Engine, kind string) engine.Event {
 	}
 }
 func TestAuthorizedNativeDesktopAndFilePipeline(t *testing.T) {
-	_, server, _ := testHub(t)
+	testAuthorizedNativeDesktopAndFilePipeline(t, false)
+}
+
+func TestAuthorizedSharedPoolDesktopAndFilePipeline(t *testing.T) {
+	testAuthorizedNativeDesktopAndFilePipeline(t, true)
+}
+
+func testAuthorizedNativeDesktopAndFilePipeline(t *testing.T, shared bool) {
+	h, server, _ := testHub(t)
+	if shared {
+		setupSharedPool(t, h)
+	}
 	root := t.TempDir()
 	ca := filepath.Join(root, "ca.pem")
 	if e := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0600); e != nil {
@@ -81,6 +92,7 @@ func TestAuthorizedNativeDesktopAndFilePipeline(t *testing.T) {
 		}
 		s.Settings.Server = server.URL
 		s.Settings.CAFile = ca
+		s.Settings.RelayOnly = shared
 		s.Settings.Unattended = true
 		s.Settings.ViewPassword = "view-test"
 		s.Settings.StandardPassword = "standard-test"
@@ -172,7 +184,12 @@ func TestAuthorizedNativeDesktopAndFilePipeline(t *testing.T) {
 		if e := a.SendFiles(sid, []string{source}); e != nil {
 			t.Fatal(e)
 		}
-		deadline := time.NewTimer(10 * time.Second)
+		if shared && i == 0 {
+			h.mu.Lock()
+			h.relayRequests[sid].session.Close()
+			h.mu.Unlock()
+		}
+		deadline := time.NewTimer(25 * time.Second)
 		saved := false
 		for !saved {
 			select {
@@ -190,6 +207,20 @@ func TestAuthorizedNativeDesktopAndFilePipeline(t *testing.T) {
 		got, e := os.ReadFile(filepath.Join(destination, name))
 		if e != nil || !bytes.Equal(got, payload) {
 			t.Fatal("file mismatch", name, e)
+		}
+	}
+	if shared {
+		manifest, err := b.OfferClipboardFiles(sid, []string{source}, int64(len(payload)), func() bool { return true })
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.mu.Lock()
+		h.relayRequests[sid].session.Close()
+		h.mu.Unlock()
+		buffer := make([]byte, 8192)
+		n, err := a.ReadClipboardFile(sid, manifest.ID, 0, 0, buffer, func() bool { return true })
+		if err != nil || n != len(buffer) || !bytes.Equal(buffer, payload[:len(buffer)]) {
+			t.Fatalf("clipboard stream failed across relay recovery: bytes=%d err=%v", n, err)
 		}
 	}
 	// Cancellation cleans incomplete files and preserves committed files.

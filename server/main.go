@@ -30,6 +30,7 @@ func runCLI() error {
 	flag.StringVar(&s.Certificate, "cert", s.Certificate, "TLS certificate PEM")
 	flag.StringVar(&s.PrivateKey, "key", s.PrivateKey, "TLS private key PEM")
 	flag.StringVar(&s.Database, "db", s.Database, "ID database")
+	configPath := flag.String("config", "", "server settings JSON file")
 	backup := flag.String("backup", "", "offline database snapshot destination")
 	flag.StringVar(&s.PublicIP, "public-ip", "", "relay IPv4 override (required if -turn-host is omitted)")
 	flag.StringVar(&s.Host, "turn-host", "", "server hostname or DDNS name")
@@ -42,17 +43,26 @@ func runCLI() error {
 	if *backup != "" {
 		return backupStoppedDatabase(s.Database, *backup)
 	}
-	host, port, err := net.SplitHostPort(*listen)
-	if err != nil {
-		return err
+	var err error
+	if *configPath != "" {
+		s, err = loadSettings(*configPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		host, port, parseErr := net.SplitHostPort(*listen)
+		if parseErr != nil {
+			return parseErr
+		}
+		if host != "" {
+			s.ListenIP = host
+		}
+		s.HTTPSPort, err = strconv.Atoi(port)
+		if err != nil {
+			return err
+		}
 	}
-	if host != "" {
-		s.ListenIP = host
-	}
-	s.HTTPSPort, err = strconv.Atoi(port)
-	if err != nil {
-		return err
-	}
+
 	service, err := startServer(s)
 	if err != nil {
 		return err

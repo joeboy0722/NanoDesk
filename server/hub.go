@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"kvm/core/protocol"
+	"kvm/core/relay"
 )
 
 type peer struct {
@@ -52,6 +54,8 @@ type window struct {
 	n  int
 }
 type signalHub struct {
+	relayPool          *relay.Pool
+	relayRequests      map[string]*relayRequestState
 	mu                 sync.Mutex
 	closing            bool
 	connections        map[*websocket.Conn]struct{}
@@ -71,7 +75,7 @@ func newHub(r *registry, host string, udp, tlsPort int) *signalHub {
 	if _, e := rand.Read(secret); e != nil {
 		panic(e)
 	}
-	return &signalHub{registry: r, connections: map[*websocket.Conn]struct{}{}, online: map[string]*peer{}, links: map[string]link{}, limits: map[string]window{}, secret: secret, turnHost: host, turnUDP: udp, turnTLS: tlsPort, maxPeers: 4096, maxLinks: 128}
+	return &signalHub{registry: r, relayRequests: make(map[string]*relayRequestState), connections: map[*websocket.Conn]struct{}{}, online: map[string]*peer{}, links: map[string]link{}, limits: map[string]window{}, secret: secret, turnHost: host, turnUDP: udp, turnTLS: tlsPort, maxPeers: 4096, maxLinks: 128}
 }
 func (h *signalHub) allow(key string, max int) bool {
 	now := time.Now()
@@ -119,11 +123,11 @@ func (h *signalHub) serve(w http.ResponseWriter, r *http.Request) {
 	if _, e = rand.Read(nonce); e != nil {
 		return
 	}
-	if e = c.WriteJSON(protocol.Signal{Type: "challenge", Version: 1, Nonce: nonce}); e != nil {
+	if e = c.WriteJSON(protocol.Signal{Type: "challenge", Version: protocol.Version, Nonce: nonce}); e != nil {
 		return
 	}
 	var m protocol.Signal
-	if e = c.ReadJSON(&m); e != nil || m.Type != "register" || m.Version != 1 || len(m.Public) != ed25519.PublicKeySize || !ed25519.Verify(m.Public, protocol.Proof(nonce), m.Signature) {
+	if e = c.ReadJSON(&m); e != nil || m.Type != "register" || m.Version != protocol.Version || len(m.Public) != ed25519.PublicKeySize || !ed25519.Verify(m.Public, protocol.Proof(nonce), m.Signature) {
 		return
 	}
 	id, e := h.registry.identify(m.Public)
@@ -149,6 +153,7 @@ func (h *signalHub) serve(w http.ResponseWriter, r *http.Request) {
 					other = l.b
 				}
 				other.send(protocol.Signal{Type: "close", Session: sid})
+				h.closeRelay(sid)
 				delete(h.links, sid)
 			}
 		}
@@ -177,7 +182,7 @@ func (h *signalHub) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	p.send(protocol.Signal{Type: "registered", ID: id, Version: 1})
+	p.send(protocol.Signal{Type: "registered", ID: id, Version: protocol.Version})
 	log.Printf("online id=%s", id)
 	for {
 		c.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -191,6 +196,9 @@ func (h *signalHub) serve(w http.ResponseWriter, r *http.Request) {
 func (h *signalHub) close() {
 	h.mu.Lock()
 	h.closing = true
+	for sid := range h.relayRequests {
+		h.closeRelay(sid)
+	}
 	connections := make([]*websocket.Conn, 0, len(h.connections))
 	for c := range h.connections {
 		connections = append(connections, c)
@@ -224,6 +232,7 @@ func (h *signalHub) route(p *peer, m protocol.Signal) {
 		count := 0
 		for sid, l := range h.links {
 			if time.Since(l.created) > 24*time.Hour {
+				h.closeRelay(sid)
 				delete(h.links, sid)
 			} else if l.a == target || l.b == target {
 				count++
@@ -239,8 +248,8 @@ func (h *signalHub) route(p *peer, m protocol.Signal) {
 		}
 		sid := hex.EncodeToString(b)
 		h.links[sid] = link{p, target, time.Now()}
-		p.send(protocol.Signal{Type: "session", Session: sid, Target: target.id, Public: target.public, IP: target.ip, Caller: true, ICE: h.ice(sid, p.id)})
-		target.send(protocol.Signal{Type: "session", Session: sid, Target: p.id, Public: p.public, IP: p.ip, ICE: h.ice(sid, target.id)})
+		p.send(protocol.Signal{Type: "session", RelayEnabled: h.relayPool != nil, Session: sid, Target: target.id, Public: target.public, IP: target.ip, Caller: true, ICE: h.ice(sid, p.id)})
+		target.send(protocol.Signal{Type: "session", RelayEnabled: h.relayPool != nil, Session: sid, Target: p.id, Public: p.public, IP: p.ip, ICE: h.ice(sid, target.id)})
 		log.Printf("session=%s from=%s to=%s", sid, p.id, target.id)
 		return
 	}
@@ -253,11 +262,14 @@ func (h *signalHub) route(p *peer, m protocol.Signal) {
 		target = l.b
 	}
 	switch m.Type {
+	case "relay_candidates", "relay_allocate", "relay_recover":
+		h.relayRequest(p, l, m)
 	case "offer", "answer":
 		if len(m.SDP) > 0 && len(m.SDP) < 100000 {
 			target.send(protocol.Signal{Type: m.Type, Session: m.Session, SDP: m.SDP})
 		}
 	case "close":
+		h.closeRelay(m.Session)
 		delete(h.links, m.Session)
 		target.send(protocol.Signal{Type: "close", Session: m.Session})
 	}
@@ -268,6 +280,24 @@ func (h *signalHub) password(username string) string {
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
 func (h *signalHub) ice(sid, id string) []protocol.ICE {
+	if h.relayPool != nil {
+		peer := h.online[id]
+		if peer == nil {
+			return nil
+		}
+		source, err := netip.ParseAddr(peer.ip)
+		if err != nil {
+			return nil
+		}
+		var servers []protocol.ICE
+		for _, candidate := range h.relayPool.Candidates(source) {
+			servers = append(servers, protocol.ICE{URLs: []string{"stun:" + candidate.Address}})
+			if len(servers) == 8 {
+				break
+			}
+		}
+		return servers
+	}
 	if h.turnHost == "" {
 		return nil
 	}

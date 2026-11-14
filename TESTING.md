@@ -123,3 +123,37 @@
 另有 `go run ./tests/soak -duration 30m -rebuild 10s` 的主動擷取／編碼壓力工具，僅適合可中斷工作的測試機。此次在目前非測試機執行 soak 的要求被自動核准審查拒絕，未執行；未產生任何長時間壓力測試結果。
 
 參考：[Go NewCallback](https://github.com/golang/go/blob/master/src/syscall/syscall_windows.go)、[IMFActivate ShutdownObject](https://learn.microsoft.com/en-us/windows/win32/api/mfobjects/nf-mfobjects-imfactivate-shutdownobject)、[SetThreadExecutionState](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate)。
+
+## 2026-11-14 共用 UDP 埠池本機量測
+
+執行環境為 Windows amd64、AMD Ryzen 5 5600、12 個邏輯處理器。每個案例維持 20 組 UDP 通道，以 Go benchmark 的 12 個並行工作者進行往返。每個案例量測 1 秒，重複 3 次，另有每工作者等待 100ms 的低負載案例。完整輸出保存在 [relay-benchmark.txt](tests/relay-benchmark.txt)。
+
+重跑命令為 `go test ./core/relay -run '^$' -bench BenchmarkRelayPorts -benchtime 1s -count=3 -timeout 90s`。
+
+下表為 1200-byte payload、無額外節流案例的中位數。吞吐量計入雙向應用資料，CPU 是客戶端與中繼所在整個測試程序占全部邏輯處理器的比例。
+
+| UDP Port 數 | 雙向 payload MB/s | 平均 RTT ms | 測試程序 CPU % |
+|---|---|---|---|
+| 1 | 84.36 | 0.3412 | 34.32 |
+| 2 | 116.41 | 0.2470 | 50.79 |
+| 5 | 122.34 | 0.2345 | 52.97 |
+
+所有案例的讀寫錯誤與中繼佇列丟包均為零。低負載案例的總吞吐量相近；低負載下的極短 RTT 和接近零的 CPU 數值受 Windows 計時解析度影響。
+
+本機結果顯示，多 socket 能改善此工作負載的處理量，但 2 個增加到 5 個的收益較小。這項量測包含客戶端加密驗證、資料複製與 echo 處理，沒有經過實體網卡、NAT 或外網，也未證明整機 CPU 或實體頻寬已飽和。實體網卡滿載、不同線路容量與跨機延遲仍需測試。
+
+已另通過 20 組並存 WebRTC 資料通道共用一個 Port、IPv4 與 IPv6 跨端點轉送、UDP／HTTPS TLS／混合中繼，以及傳檔與剪貼簿按需讀取跨越路徑改派的自動化驗證。GUI 畫面擷取回報 FrameArrived timed out，點擊回報 coordinate input geometry is unavailable，目前僅確認程序啟動與主控台可存取性，完整介面操作與雙機多網卡驗收仍待完成。
+
+### 本機交付驗證與暫緩項目
+
+2026-11-14 已通過 `TestTwentySharedPortMixedSessions`。二十組 App 工作階段及四十個中繼端同時保持在線，共用單一 UDP socket；逐組檢查模擬桌面的 H.264 視訊、模擬輸入計數、獨立聊天訊息、檔案內容與剪貼簿按需讀取。建立裝置分兩批，保留每來源每分鐘三十次註冊的正式限制。
+
+本機另已驗證 STUN 來源權限、IPv4／IPv6 跨端點、容量滿載拒絕、預設模式在中繼滿載時繼續直連、UDP 不可達時選 TLS、UDP／TLS 混合連線、立即停用 TLS 端點後改派、設定儲存失敗復原與舊設定備份遷移。`core/relay` 的 race 檢查，以及伺服器新中繼／恢復整合流程的 race 檢查通過。
+
+完整 `go test ./... -count=1 -timeout 240s` 中，App、原生元件、中繼、伺服器、Web transport 及其他套件通過。既有 `core/capture.TestGDIRepeatedInitReleasesHandles` 在此環境的 `CaptureFrame` 回報 `GDI BitBlt 失敗: The handle is invalid.`，全套命令因此以失敗結束；本次沒有更改或跳過該測試。
+
+`go vet ./app/engine ./core/relay ./core/protocol ./server` 指出既有 Win32 回呼中的兩處 `possible misuse of unsafe.Pointer`，位於 `server/gui_theme_windows.go` 與 `server/gui_windows.go`。這兩處原生訊息指標轉換仍需人工檢視，未把 vet 宣告為全綠。
+
+GUI 可啟動並讀取主控台的可存取性樹。啟用視窗後再試，畫面擷取仍回報 `window capture timed out`，先前點擊也回報 `coordinate input geometry is unavailable`，因此設定頁的實際操作及視覺驗收尚未完成。
+
+使用者已指示暫緩第二台 Windows、實體多網卡與跨 NAT 驗收，這些項目記為暫緩。實體頻寬滿載測試也尚無結果。交付執行檔已重新建置，大小與 SHA256 見 [BUILD-SIZES.txt](BUILD-SIZES.txt)。

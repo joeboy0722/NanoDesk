@@ -26,7 +26,13 @@ func testHub(t *testing.T) (*signalHub, *httptest.Server, *websocket.Dialer) {
 	}
 	t.Cleanup(func() { r.db.Close() })
 	h := newHub(r, "", 3478, 5349)
-	s := httptest.NewTLSServer(http.HandlerFunc(h.serve))
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/relay" {
+			h.serveRelay(w, r)
+		} else {
+			h.serve(w, r)
+		}
+	}))
 	t.Cleanup(s.Close)
 	roots := x509.NewCertPool()
 	roots.AddCert(s.Certificate())
@@ -44,7 +50,7 @@ func registerPeer(t *testing.T, s *httptest.Server, d *websocket.Dialer, key ed2
 	if e = c.ReadJSON(&m); e != nil {
 		t.Fatal(e)
 	}
-	if e = c.WriteJSON(protocol.Signal{Type: "register", Version: 1, Public: key.Public().(ed25519.PublicKey), Signature: ed25519.Sign(key, protocol.Proof(m.Nonce))}); e != nil {
+	if e = c.WriteJSON(protocol.Signal{Type: "register", Version: protocol.Version, Public: key.Public().(ed25519.PublicKey), Signature: ed25519.Sign(key, protocol.Proof(m.Nonce))}); e != nil {
 		t.Fatal(e)
 	}
 	if e = c.ReadJSON(&m); e != nil {
@@ -117,7 +123,7 @@ func TestRegistrationProofAndDuplicateProtection(t *testing.T) {
 	defer c.Close()
 	c.SetReadDeadline(time.Now().Add(time.Second))
 	c.ReadJSON(&m)
-	c.WriteJSON(protocol.Signal{Type: "register", Version: 1, Public: k.Public().(ed25519.PublicKey), Signature: make([]byte, 64)})
+	c.WriteJSON(protocol.Signal{Type: "register", Version: protocol.Version, Public: k.Public().(ed25519.PublicKey), Signature: make([]byte, 64)})
 	if c.ReadJSON(&m) == nil {
 		t.Fatal("invalid proof accepted")
 	}

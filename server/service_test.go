@@ -4,8 +4,10 @@ import (
 	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
+	"kvm/core/relay"
 	"net"
 	"net/http"
 	"os"
@@ -94,7 +96,7 @@ func TestServerStartStopRestartAndLiveBackup(t *testing.T) {
 	}
 	private := key(t)
 	public := private.Public().(ed25519.PublicKey)
-	ws.WriteJSON(protocol.Signal{Type: "register", Version: 1, Public: public, Signature: ed25519.Sign(private, protocol.Proof(m.Nonce))})
+	ws.WriteJSON(protocol.Signal{Type: "register", Version: protocol.Version, Public: public, Signature: ed25519.Sign(private, protocol.Proof(m.Nonce))})
 	if err = ws.ReadJSON(&m); err != nil || m.Type != "registered" {
 		t.Fatal(m, err)
 	}
@@ -264,5 +266,50 @@ func TestServerWithHostnameOnly(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("health endpoint returned %s", response.Status)
+	}
+}
+
+func TestSharedPoolServiceDoesNotOpenLegacyTURN(t *testing.T) {
+	s := serviceSettings(t)
+	port := uint16(s.TURNPort)
+	occupied, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", fmt.Sprint(s.TURNTLSPort)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+	s.RelayPool = &relay.Config{TotalMbps: 100, SessionMbps: 5, Groups: []relay.GroupConfig{{ID: "g", Name: "Default", Default: true, CapacityMbps: 100, Endpoints: []relay.EndpointConfig{{ID: "e", BindIP: "127.0.0.1", PublicHost: "127.0.0.1", Ports: []uint16{port}, Enabled: true}}}}}
+	s.TURNPort = 0
+	s.RelayMin, s.RelayMax = 0, 0
+	service, err := startServer(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	if service.turn != nil || service.generator != nil {
+		t.Fatal("shared relay still started legacy TURN")
+	}
+	if len(service.hub.ice("unused", "unused")) != 0 {
+		t.Fatal("shared relay advertised legacy TURN")
+	}
+	if len(service.hub.relayPool.Stats()) != 1 {
+		t.Fatal("shared socket missing")
+	}
+	next := s
+	data, err := json.Marshal(s.RelayPool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.RelayPool = &relay.Config{}
+	if err := json.Unmarshal(data, next.RelayPool); err != nil {
+		t.Fatal(err)
+	}
+	next.RelayPool.TotalMbps = 80
+	path := filepath.Join(t.TempDir(), "server-settings.json")
+	if err := service.ApplyRelaySettings(path, next); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadSettings(path)
+	if err != nil || loaded.RelayPool.TotalMbps != 80 {
+		t.Fatalf("live settings not persisted: %v", err)
 	}
 }

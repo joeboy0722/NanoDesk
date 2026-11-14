@@ -150,6 +150,7 @@ type guiResult struct {
 	err      error
 }
 type serverGUI struct {
+	relayEditor                                                             relayEditor
 	positions                                                               map[uintptr]guiRect
 	scrollX, scrollY                                                        int
 	layingOut                                                               bool
@@ -262,7 +263,7 @@ func (g *serverGUI) build() {
 	win("SendMessageW", g.logs, 0x30, g.monoFont, 1)
 	win("SendMessageW", g.logs, 0x00c5, 64000, 0)
 	g.category = g.control("LISTBOX", "", 1|0x10000, idCategory, 24, 86, 144, 346)
-	for _, name := range []string{"一般連線", "憑證與 ID 資料", "進階連接埠"} {
+	for _, name := range []string{"一般連線", "憑證與 ID 資料", "進階連接埠", "中繼端點池"} {
 		p := wide(name)
 		win("SendMessageW", g.category, 0x180, 0, uintptr(unsafe.Pointer(p)))
 		runtime.KeepAlive(p)
@@ -298,12 +299,14 @@ func (g *serverGUI) build() {
 	g.settings = append(g.settings, g.save)
 	g.saveStart = g.control("BUTTON", "儲存並啟動", 0x10000, idSaveStart, 718, 636, 164, 40)
 	g.settings = append(g.settings, g.saveStart)
+	g.buildRelayEditor()
 	g.fill(g.saved)
 	g.visibility()
 }
 func (g *serverGUI) fill(s serverSettings) {
 	g.loading = true
 	defer func() { g.loading = false; g.dirty = false }()
+	g.fillRelayEditor(s)
 	values := map[int]string{fieldPublic: s.PublicIP, fieldHost: s.Host, fieldCert: s.Certificate, fieldKey: s.PrivateKey, fieldDB: s.Database, fieldCA: s.CAFile, fieldListen: s.ListenIP, fieldHTTPS: strconv.Itoa(s.HTTPSPort), fieldUDP: strconv.Itoa(s.TURNPort), fieldTLS: strconv.Itoa(s.TURNTLSPort), fieldMin: strconv.Itoa(s.RelayMin), fieldMax: strconv.Itoa(s.RelayMax), fieldMbps: strconv.Itoa(s.RelayMbps)}
 	for id, value := range values {
 		setText(g.edits[id], value)
@@ -316,6 +319,14 @@ func (g *serverGUI) fill(s serverSettings) {
 }
 func (g *serverGUI) read() (serverSettings, error) {
 	s := g.saved
+	if err := g.storeRelayRow(); err != nil {
+		return s, err
+	}
+	s.RelayPool = nil
+	if relayChecked(g.relayEditor.enabled) {
+		config := g.relayEditor.config
+		s.RelayPool = &config
+	}
 	s.PublicIP = strings.TrimSpace(getText(g.edits[fieldPublic]))
 	s.Host = strings.TrimSpace(getText(g.edits[fieldHost]))
 	s.Certificate = getText(g.edits[fieldCert])
@@ -404,10 +415,15 @@ func (g *serverGUI) post(result guiResult) {
 	win("PostMessageW", g.hwnd, uiCompletion, 0, 0)
 }
 func (g *serverGUI) saveAction(start bool) {
-	if g.busy || g.controller.Snapshot().Phase != "stopped" {
+	if g.busy {
+		return
+	}
+	phase := g.controller.Snapshot().Phase
+	if phase != "stopped" && phase != "running" {
 		return
 	}
 	s, e := g.read()
+	s.MigrationPending = false
 	if e != nil {
 		g.closeAfterSave = false
 		showMessage(g.hwnd, e.Error(), 0x10)
@@ -421,7 +437,12 @@ func (g *serverGUI) saveAction(start bool) {
 	g.busy = true
 	g.refresh()
 	go func() {
-		e := saveSettings(g.path, s)
+		var e error
+		if phase == "running" {
+			e = g.controller.ApplyRelaySettings(g.path, s)
+		} else {
+			e = saveSettings(g.path, s)
+		}
 		kind := "saved"
 		if start {
 			kind = "saved-start"
@@ -537,6 +558,7 @@ func (g *serverGUI) complete() {
 }
 func (g *serverGUI) refresh() {
 	snapshot := g.controller.Snapshot()
+	g.refreshRelayStats(snapshot)
 	if g.closing && snapshot.Phase == "stopped" && !g.busy {
 		win("DestroyWindow", g.hwnd)
 		return
@@ -585,13 +607,17 @@ func (g *serverGUI) refresh() {
 	}
 	notice := ""
 	if snapshot.Phase != "stopped" {
-		notice = "服務執行期間設定鎖定。請先停止服務再修改。"
+		notice = "服務運作中可套用中繼端點池；其他設定請先停止服務。"
 	}
 	if notice != g.lastNotice {
 		setText(g.lockNotice, notice)
 		g.lastNotice = notice
 	}
-	enable(g.save, editable)
+	runtimeEditable := snapshot.Phase == "running" && !g.busy && !g.closing
+	for _, h := range g.relayEditor.controls {
+		enable(h, editable || runtimeEditable)
+	}
+	enable(g.save, editable || runtimeEditable)
 	enable(g.saveStart, editable)
 	enable(g.start, editable)
 	enable(g.stop, (snapshot.Phase == "starting" || snapshot.Phase == "running") && !g.closing)
@@ -669,6 +695,12 @@ func serverWndProc(h uintptr, msg uint32, w, l uintptr) uintptr {
 			g.section = int(win("SendMessageW", g.category, 0x188, 0, 0))
 			g.scrollY = 0
 			g.reflow()
+		case id == relayDisableID:
+			g.disableRelayEndpoint()
+		case id >= relayListID && id <= relayRemoveID:
+			g.relayCommand(id, notification)
+		case !g.loading && id >= relayEnabledID && id <= relayEndpointEnabledID && (notification == 0x300 || notification == 0):
+			g.dirty = true
 		case id == idSave:
 			g.saveAction(false)
 		case id == idSaveStart:
