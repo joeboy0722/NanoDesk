@@ -170,6 +170,8 @@ type StreamHub struct {
 	currentMonitor       int
 	encoder              *encoder.H264Encoder
 	requestKeyNext       bool
+	lastKeyRequest       time.Time
+	videoBitrateKbps     int
 	inputCtrl            remoteInput
 	authMgr              *auth.AuthManager
 	hostGUI              HostUI
@@ -227,7 +229,7 @@ func (h *StreamHub) initEncoderForCurrentMonitor() error {
 
 	m := h.monitors[h.currentMonitor]
 	fps := 30
-	bitrateKbps := 5000 // 5.0 Mbps 基礎碼率 (支援動態峰值 12 Mbps)
+	bitrateKbps := h.targetVideoBitrateLocked()
 
 	enc, err := encoder.NewH264Encoder(m.Width, m.Height, fps, bitrateKbps)
 	if err != nil {
@@ -238,7 +240,9 @@ func (h *StreamHub) initEncoderForCurrentMonitor() error {
 		h.encoder.Close()
 	}
 	h.encoder = enc
+	h.videoBitrateKbps = bitrateKbps
 	h.requestKeyNext = true
+	h.lastKeyRequest = time.Time{}
 	fmt.Printf("🎥 已為螢幕 %d (%dx%d) 啟用 H.264 即時編碼器\n", m.Index, m.Width, m.Height)
 	return nil
 }
@@ -281,9 +285,7 @@ func (h *StreamHub) sendInitInfo(c *Client) {
 	h.mu.Lock()
 	monitors := h.monitors
 	curMon := h.currentMonitor
-	if h.encoder != nil {
-		h.encoder.RequestKeyframe()
-	}
+	h.requestKeyNext = true
 	h.mu.Unlock()
 
 	c.safeSendJSON(map[string]interface{}{
@@ -564,9 +566,35 @@ func (h *StreamHub) switchMonitor(targetIdx int) {
 func (h *StreamHub) requestKeyframe() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.encoder != nil {
-		h.encoder.RequestKeyframe()
+	h.requestKeyNext = true
+}
+
+// Queue overflow and multiple viewers can request IDRs together. Coalesce
+// those requests instead of turning every subsequent frame into a large IDR.
+func (h *StreamHub) takeKeyframeRequest(now time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.requestKeyNext || (!h.lastKeyRequest.IsZero() && now.Sub(h.lastKeyRequest) < time.Second) {
+		return false
 	}
+	h.requestKeyNext = false
+	h.lastKeyRequest = now
+	return true
+}
+
+// Caller owns h.mu (or is constructing the host before it starts).
+func (h *StreamHub) targetVideoBitrateLocked() int {
+	target := 3500
+	for c := range h.clients {
+		if h.validLocked(c) {
+			if budget, ok := c.conn.(interface{ VideoBitrateKbps() int }); ok {
+				if kbps := budget.VideoBitrateKbps(); kbps > 0 {
+					target = min(target, kbps)
+				}
+			}
+		}
+	}
+	return target
 }
 
 // 廣播二進位視訊流封包至所有客戶端 (快照派發，非阻塞零等待)
@@ -635,12 +663,16 @@ func (h *StreamHub) startStreamingLoop() {
 	defer ticker.Stop()
 
 	var startTime = time.Now()
+	var nextFrameAt time.Time
 
 	for {
 		select {
 		case <-h.done:
 			return
 		case <-ticker.C:
+		}
+		if time.Now().Before(nextFrameAt) {
+			continue
 		}
 		h.streamMu.Lock()
 		// 只有在至少有一個客戶端連線時才抓取並壓縮，完全零無效負載！
@@ -652,7 +684,13 @@ func (h *StreamHub) startStreamingLoop() {
 			}
 		}
 		curMon := h.currentMonitor
+		if clientCount > 0 && h.encoder != nil && h.videoBitrateKbps != h.targetVideoBitrateLocked() {
+			if err := h.initEncoderForCurrentMonitor(); err != nil {
+				fmt.Printf("H.264 bandwidth reconfiguration failed: %v\n", err)
+			}
+		}
 		enc := h.encoder
+		bitrateKbps := h.videoBitrateKbps
 		h.mu.Unlock()
 
 		if clientCount == 0 || enc == nil {
@@ -671,6 +709,10 @@ func (h *StreamHub) startStreamingLoop() {
 		}
 
 		// 2. H.264 即時編碼
+		encodeStarted := time.Now()
+		if h.takeKeyframeRequest(time.Now()) {
+			enc.RequestKeyframe()
+		}
 		nalu, isKey, err := enc.Encode(frame.Data)
 		h.streamMu.Unlock()
 		if err != nil || len(nalu) == 0 {
@@ -679,6 +721,10 @@ func (h *StreamHub) startStreamingLoop() {
 			}
 			continue
 		}
+		// The encoder's bitrate is a target, not an absolute bound for arbitrary
+		// pixels. Slow capture BEFORE encoding the next frame when output is
+		// expensive; dropping encoded reference frames would break the GOP.
+		nextFrameAt = encodeStarted.Add(videoFrameDelay(len(nalu), bitrateKbps))
 
 		// 3. 封裝 Web KVM 二進位協議：
 		// [0]: isKey (1 或 0)

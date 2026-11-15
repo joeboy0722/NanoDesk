@@ -38,6 +38,7 @@ func relayPeerAPI(path *protocol.RelayPath, caller bool, config identity.Setting
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("中繼路徑建立失敗: %w", err)
 	}
+	conn.SetPacingMbps(path.BandwidthMbps)
 	stable := relay.NewSwitchConn(conn, local, onFailure)
 	var mux ice.UDPMux = ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: stable})
 	if !config.RelayOnly && !config.RelayTLSOnly {
@@ -54,7 +55,12 @@ func relayPeerAPI(path *protocol.RelayPath, caller bool, config identity.Setting
 	settings.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	settings.SetSCTPMaxMessageSize(65536)
 	settings.SetICETimeouts(5*time.Second, 25*time.Second, time.Second)
-	return webrtc.NewAPI(webrtc.WithSettingEngine(settings)), mux, stable, nil
+	api, err := videoAPI(settings)
+	if err != nil {
+		mux.Close()
+		return nil, nil, nil, err
+	}
+	return api, mux, stable, nil
 }
 
 func dialTLSRelay(path *protocol.RelayPath, remote net.Addr, config identity.Settings) (*relay.ClientConn, error) {
@@ -201,6 +207,7 @@ func (p *Peer) replaceRelay(path *protocol.RelayPath) error {
 	if err != nil {
 		return err
 	}
+	conn.SetPacingMbps(path.BandwidthMbps)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed || path.Credentials.Generation <= p.relayGeneration {
@@ -211,6 +218,7 @@ func (p *Peer) replaceRelay(path *protocol.RelayPath) error {
 		return err
 	}
 	p.relayGeneration = path.Credentials.Generation
+	p.relayBudgetMbps.Store(path.BandwidthMbps)
 	p.relayRecovering = false
 	p.relayRecoveryTicket++
 	p.engine.emit(Event{Kind: "peer_status", Session: p.sid, Text: "中繼路徑已恢復"})

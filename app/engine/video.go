@@ -1,6 +1,29 @@
 package engine
 
-import "time"
+import (
+	"github.com/pion/rtp/codecs"
+	"github.com/pion/webrtc/v4/pkg/media"
+	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
+	"time"
+)
+
+func (e *Engine) emitVideoSample(p *Peer, sample *media.Sample) {
+	if sample.PrevDroppedPackets > 0 {
+		e.videoMu.Lock()
+		e.waitingKey[p.sid] = true
+		e.videoMu.Unlock()
+	}
+	e.emitVideo(p, sample.Data)
+}
+
+func newVideoSampleBuilder() *samplebuilder.SampleBuilder {
+	// A desktop IDR can span thousands of packets. A packet window smaller
+	// than one frame destroys its head before its tail arrives, even on TLS.
+	// Keep sequence distance below half the uint16 space and bound old GOPs
+	// by media time so packet loss does not cause unbounded playback latency.
+	return samplebuilder.New(32767, &codecs.H264Packet{}, 90000,
+		samplebuilder.WithMaxTimeDelay(250*time.Millisecond))
+}
 
 func annexKeyframe(data []byte) bool {
 	for i := 0; i+4 < len(data); i++ {

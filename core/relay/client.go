@@ -2,6 +2,7 @@ package relay
 
 import (
 	"errors"
+	"golang.org/x/time/rate"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,7 @@ import (
 // ClientConn preserves packet boundaries over an authenticated relay route.
 // The socket is owned by this connection. Credentials are in server orientation.
 type ClientConn struct {
+	pacer        atomic.Pointer[rate.Limiter]
 	lastActivity atomic.Int64
 	failed       chan struct{}
 	done         chan struct{}
@@ -22,6 +24,16 @@ type ClientConn struct {
 	writeMu      sync.Mutex
 	sequence     uint64
 	replay       ReplayWindow
+}
+
+// SetPacingMbps spreads frame bursts over the reserved route bandwidth.
+// Leave headroom for relay, SRTP and control traffic. Existing callers that
+// do not opt in retain their original PacketConn behavior.
+func (c *ClientConn) SetPacingMbps(mbps int64) {
+	if mbps <= 0 {
+		mbps = 5
+	} // Compatibility with servers predating this field.
+	c.pacer.Store(rate.NewLimiter(rate.Limit(float64(mbps)*1000000/8*.85), 2*(HeaderSize+MaxPayload+TagSize)))
 }
 
 func DialUDP(network, server string, peer net.Addr, credentials RouteCredentials) (*ClientConn, error) {
@@ -44,6 +56,9 @@ func dialUDP(network, server string, peer net.Addr, credentials RouteCredentials
 	conn, err := net.ListenPacket(network, ":0")
 	if err != nil {
 		return nil, err
+	}
+	if udp, ok := conn.(*net.UDPConn); ok {
+		_ = udp.SetReadBuffer(1024 * 1024)
 	}
 	return connectPacket(conn, address, peer, credentials, timeout)
 }
@@ -113,6 +128,24 @@ func (c *ClientConn) decode(data []byte, source net.Addr) (Packet, bool) {
 func (c *ClientConn) send(kind Kind, payload []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	if kind == Data {
+		if limiter := c.pacer.Load(); limiter != nil {
+			reservation := limiter.ReserveN(time.Now(), len(payload)+HeaderSize+TagSize)
+			if !reservation.OK() {
+				return errors.New("relay packet exceeds pacing burst")
+			}
+			if delay := reservation.Delay(); delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-c.done:
+					timer.Stop()
+					reservation.Cancel()
+					return net.ErrClosed
+				}
+			}
+		}
+	}
 	if c.sequence == ^uint64(0) {
 		return errors.New("relay sequence exhausted")
 	}

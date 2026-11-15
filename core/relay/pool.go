@@ -127,12 +127,13 @@ func (p *Pool) ApplyWithCommit(config Config, commit func() error) error {
 }
 
 type Reservation struct {
-	EndpointID string
-	limiters   []*rate.Limiter
-	Address    netip.AddrPort
-	Endpoint   *Endpoint
-	release    func()
-	once       sync.Once
+	BandwidthMbps int64
+	EndpointID    string
+	limiters      []*rate.Limiter
+	Address       netip.AddrPort
+	Endpoint      *Endpoint
+	release       func()
+	once          sync.Once
 }
 
 func (r *Reservation) Close() { r.once.Do(r.release) }
@@ -191,7 +192,7 @@ func (p *Pool) Reserve(source netip.Addr, reachable []netip.AddrPort) (*Reservat
 	chosen.reservations++
 	p.reserved[group.ID] += budget
 	p.total += budget
-	return &Reservation{EndpointID: chosen.id, limiters: []*rate.Limiter{rate.NewLimiter(rate.Limit(float64(budget)*1000000/8), 64000), p.groupLimiters[group.ID], p.totalLimiter}, Address: address, Endpoint: chosen.endpoint, release: func() {
+	return &Reservation{BandwidthMbps: budget, EndpointID: chosen.id, limiters: []*rate.Limiter{rate.NewLimiter(rate.Limit(float64(budget)*1000000/8), 64000), p.groupLimiters[group.ID], p.totalLimiter}, Address: address, Endpoint: chosen.endpoint, release: func() {
 		p.mu.Lock()
 		defer p.mu.Unlock()
 		chosen.reservations--

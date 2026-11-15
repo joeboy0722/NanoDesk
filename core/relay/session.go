@@ -9,6 +9,7 @@ import (
 )
 
 type Session struct {
+	BandwidthMbps             int64
 	mu                        sync.Mutex
 	closed                    bool
 	transports                []*Endpoint
@@ -30,7 +31,7 @@ func (p *Pool) OpenSession(leftSource, rightSource netip.Addr, leftReachable, ri
 		a.Close()
 		return nil, err
 	}
-	session := &Session{left: a, right: b, LeftAddress: a.Address, RightAddress: b.Address}
+	session := &Session{left: a, right: b, LeftAddress: a.Address, RightAddress: b.Address, BandwidthMbps: min(a.BandwidthMbps, b.BandwidthMbps)}
 	credentials := []*RouteCredentials{&session.Left, &session.Right}
 	for _, c := range credentials {
 		c.Generation = generation

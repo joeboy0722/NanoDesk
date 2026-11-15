@@ -14,10 +14,8 @@ import (
 	"github.com/gorilla/websocket"
 	pionice "github.com/pion/ice/v4"
 	"github.com/pion/rtcp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
-	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 	"kvm/core/auth"
 	"kvm/core/desktop"
 	"kvm/core/identity"
@@ -54,6 +52,12 @@ type Services struct {
 	ReceiveDirectory func() (string, error)
 }
 type Peer struct {
+	diagnosticPackets   atomic.Uint64
+	diagnosticBytes     atomic.Uint64
+	diagnosticSamples   atomic.Uint64
+	diagnosticKeys      atomic.Uint64
+	relayBudgetMbps     atomic.Int64
+	videoRate           videoRateController
 	relaySocket         *relay.SwitchConn
 	relayGeneration     uint64
 	relayRecovering     bool
@@ -515,6 +519,7 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 	p := &Peer{relaySocket: relaySocket, relayMux: relayMux, engine: e, sid: m.Session, id: m.Target, ip: m.IP, caller: m.Caller, pc: pc, fileAck: make(chan fileMeta, 8)}
 	if m.RelayPath != nil {
 		p.relayGeneration = m.RelayPath.Credentials.Generation
+		p.relayBudgetMbps.Store(m.RelayPath.BandwidthMbps)
 	}
 	e.mu.Lock()
 	e.peers[m.Session] = p
@@ -578,15 +583,21 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 				p.Close()
 				return
 			}
-			builder := samplebuilder.New(128, &codecs.H264Packet{}, 90000)
+			builder := newVideoSampleBuilder()
 			for {
 				packet, _, er := t.ReadRTP()
 				if er != nil {
 					return
 				}
+				p.diagnosticPackets.Add(1)
+				p.diagnosticBytes.Add(uint64(len(packet.Payload)))
 				builder.Push(packet)
 				for sample := builder.Pop(); sample != nil; sample = builder.Pop() {
-					e.emitVideo(p, sample.Data)
+					p.diagnosticSamples.Add(1)
+					if annexKeyframe(sample.Data) {
+						p.diagnosticKeys.Add(1)
+					}
+					e.emitVideoSample(p, sample)
 				}
 			}
 		})
@@ -616,7 +627,15 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 					return
 				}
 				for _, packet := range packets {
-					switch packet.(type) {
+					switch feedback := packet.(type) {
+					case *rtcp.ReceiverReport:
+						for _, report := range feedback.Reports {
+							for _, encoding := range sender.GetParameters().Encodings {
+								if report.SSRC == uint32(encoding.SSRC) {
+									p.videoRate.observe(time.Now(), p.configuredVideoBitrateKbps(), report.FractionLost)
+								}
+							}
+						}
 					case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
 						p.mu.Lock()
 						c := p.client
@@ -905,6 +924,18 @@ func (p *Peer) handle(b []byte) {
 }
 
 // Implement desktop.Transport without exposing the WebRTC library to Web builds.
+func (p *Peer) VideoBitrateKbps() int {
+	return p.videoRate.limit(p.configuredVideoBitrateKbps())
+}
+
+func (p *Peer) configuredVideoBitrateKbps() int {
+	mbps := p.relayBudgetMbps.Load()
+	if mbps > 0 && mbps < 5 {
+		return int(mbps) * 700
+	}
+	return 3500
+}
+
 func (p *Peer) WriteMessage(kind int, b []byte) error {
 	if kind == desktop.MessageVideo {
 		if len(b) < 6 {

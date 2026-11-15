@@ -12,9 +12,10 @@ type ICE struct {
 	Credential string   `json:"credential,omitempty"`
 }
 type RelayPath struct {
-	TLS         bool                   `json:"tls,omitempty"`
-	Address     string                 `json:"address"`
-	Credentials relay.RouteCredentials `json:"credentials"`
+	BandwidthMbps int64                  `json:"bandwidth_mbps,omitempty"`
+	TLS           bool                   `json:"tls,omitempty"`
+	Address       string                 `json:"address"`
+	Credentials   relay.RouteCredentials `json:"credentials"`
 }
 
 type Signal struct {

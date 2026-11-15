@@ -6,6 +6,7 @@
 #include <strmif.h>
 #include <codecapi.h>
 #include <vector>
+#include <algorithm>
 #include <string>
 #include <stdio.h>
 
@@ -172,7 +173,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
         pAttrs->Release();
     }
 
-    // 2. 設定即時低延遲模式與動態碼率 (VBR / Quality-based Rate Control)
+    // 2. Low-latency CBR: live video must fit its transport budget.
     ICodecAPI* pCodecAPI = NULL;
     if (SUCCEEDED(ctx->pTransform->QueryInterface(IID_CodecAPI, (void**)&pCodecAPI))) {
         VARIANT var;
@@ -183,35 +184,23 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
         var.boolVal = VARIANT_TRUE;
         pCodecAPI->SetValue(&CODECAPI_AVLowLatencyMode, &var);
 
-        // 設定碼率控制模式為品質優先動態碼率 (Quality VBR / eAVEncCommonRateControlMode_Quality = 2)
-        // 亦可相容 eAVEncCommonRateControlMode_PeakConstrainedVBR = 1
         var.vt = VT_UI4;
-        var.ulVal = 2; // eAVEncCommonRateControlMode_Quality
-        pCodecAPI->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);
-
-        // 設定畫質等級 (範圍 0~100，80 代表高銳利度)
-        var.vt = VT_UI4;
-        var.ulVal = 80;
-        pCodecAPI->SetValue(&CODECAPI_AVEncCommonQuality, &var);
+        var.ulVal = eAVEncCommonRateControlMode_CBR;
+        if (FAILED(pCodecAPI->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var))) {
+            pCodecAPI->Release();
+            H264_DestroyEncoder(ctx);
+            return NULL;
+        }
 
         // 設定目標平均碼率
         var.vt = VT_UI4;
         var.ulVal = ctx->bitrate;
         pCodecAPI->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var);
+        var.ulVal = std::max(1, ctx->bitrate / 8 / 2);
+        pCodecAPI->SetValue(&CODECAPI_AVEncCommonBufferSize, &var);
 
-        // 設定最大動態峰值碼率 (允許劇烈動態時最高爆發到 25 Mbps，快速甩動完全無壓力)
-        var.vt = VT_UI4;
-        var.ulVal = 25000 * 1000;
-        pCodecAPI->SetValue(&CODECAPI_AVEncCommonMaxBitRate, &var);
-
-        // 關鍵：限制量化參數 MaxQP ≤ 28 (硬性禁止編碼器為了降碼率而把畫面抹糊！)
-        var.vt = VT_UI4;
-        var.ulVal = 28;
-        pCodecAPI->SetValue(&CODECAPI_AVEncVideoMaxQP, &var);
-
-        var.vt = VT_UI4;
-        var.ulVal = 18;
-        pCodecAPI->SetValue(&CODECAPI_AVEncVideoMinQP, &var);
+        // Leave QP unconstrained so busy desktops can trade image detail
+        // for timely delivery instead of overriding the bitrate target.
 
         // 縮短關鍵幀週期 (GOP) 至 1 秒 (30 幀)，手一停下 1 秒內必定滿血恢復
         var.vt = VT_UI4;

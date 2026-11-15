@@ -943,9 +943,12 @@ static LRESULT CALLBACK canvasProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         HDC dc = BeginPaint(h, &ps);
         RECT rc;
         GetClientRect(h, &rc);
-        fill(dc, rc, highContrast ? GetSysColor(COLOR_WINDOW) : canvasBackground);
-        if (r->decoder)
+        // The decoder covers the entire canvas. Clearing it with GDI before
+        // every Direct3D Present exposes a blank background between frames.
+        if (r->decoder && !r->decoder->bgra.empty())
             r->decoder->paint(dc, rc.right, rc.bottom);
+        else
+            fill(dc, rc, highContrast ? GetSysColor(COLOR_WINDOW) : canvasBackground);
         for (auto &item : pointers[r->sid]) {
             auto &p = item.second;
             if (GetTickCount64() - p.at > 1500)

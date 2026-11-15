@@ -63,5 +63,5 @@ func peerAPI(settings identity.Settings, servers []protocol.ICE) (*webrtc.API, e
 	var se webrtc.SettingEngine
 	se.SetICEProxyDialer(&turnTLSDialer{allowed: allowed, config: cfg})
 	se.SetSCTPMaxMessageSize(65536)
-	return webrtc.NewAPI(webrtc.WithSettingEngine(se)), nil
+	return videoAPI(se)
 }

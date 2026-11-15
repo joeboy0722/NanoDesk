@@ -125,7 +125,7 @@ func (h *signalHub) relayRequest(p *peer, l link, m protocol.Signal) {
 	} {
 		for _, candidate := range h.relayPool.Candidates(netip.MustParseAddr(side.client.ip)) {
 			if candidate.BindAddress == side.address.String() {
-				side.client.send(protocol.Signal{Type: "relay_ready", Session: m.Session, RelayPath: &protocol.RelayPath{TLS: side.tls, Address: candidate.Address, Credentials: side.credentials}})
+				side.client.send(protocol.Signal{Type: "relay_ready", Session: m.Session, RelayPath: &protocol.RelayPath{BandwidthMbps: session.BandwidthMbps, TLS: side.tls, Address: candidate.Address, Credentials: side.credentials}})
 				break
 			}
 		}

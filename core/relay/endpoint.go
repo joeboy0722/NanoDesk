@@ -63,6 +63,9 @@ type Endpoint struct {
 }
 
 func NewEndpoint(conn net.PacketConn) *Endpoint {
+	if udp, ok := conn.(*net.UDPConn); ok {
+		_ = udp.SetReadBuffer(4 * 1024 * 1024)
+	}
 	e := &Endpoint{bindingRate: rate.NewLimiter(100, 100), conn: conn, ready: make(chan *route, 256), done: make(chan struct{})}
 	for i := range e.shards {
 		e.shards[i].routes = make(map[ChannelID]*route)

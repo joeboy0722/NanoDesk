@@ -210,7 +210,8 @@ int Decoder::feed(const unsigned char *data, int length) {
         release(allocated);
     }
     if (result && hwnd && IsWindowVisible(hwnd)) {
-        present();
+        // Present only from WM_PAINT, once per redraw. Do not race GDI
+        // canvas painting with an immediate second presentation here.
         InvalidateRect(hwnd, nullptr, FALSE);
     }
     return result;
@@ -293,10 +294,9 @@ void Decoder::present() {
 void Decoder::paint(HDC dc, int w, int h) {
     if (bgra.empty())
         return;
-    if (swap) {
-        present();
+    present();
+    if (swap)
         return;
-    }
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = width;
