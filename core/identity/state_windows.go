@@ -10,9 +10,13 @@ import (
 	"path/filepath"
 	"syscall"
 	"unsafe"
+
+	"kvm/core/appprofile"
 )
 
 type Settings struct {
+	EmbeddedCA       string `json:"-"`
+	ServerLocked     bool   `json:"-"`
 	RelayOnly        bool   `json:"relay_only"`
 	RelayTLSOnly     bool   `json:"relay_tls_only"`
 	Server           string `json:"server"`
@@ -25,11 +29,37 @@ type Settings struct {
 	Clipboard        bool   `json:"clipboard"`
 }
 type State struct {
-	Private  ed25519.PrivateKey `json:"private"`
-	LastID   string             `json:"last_id"`
-	Settings Settings           `json:"settings"`
-	Path     string             `json:"-"`
+	Private    ed25519.PrivateKey `json:"private"`
+	LastID     string             `json:"last_id"`
+	Settings   Settings           `json:"settings"`
+	Path       string             `json:"-"`
+	profile    *appprofile.Profile
+	baseServer string
+	baseCAFile string
 }
+
+// ApplyProfile overlays only connection settings, retaining their persisted values.
+func (s *State) ApplyProfile(p appprofile.Profile) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if s.profile == nil {
+		s.baseServer, s.baseCAFile = s.Settings.Server, s.Settings.CAFile
+	}
+	s.profile = &p
+	s.Settings = s.EnforceProfile(s.Settings)
+	return nil
+}
+
+func (s *State) EnforceProfile(settings Settings) Settings {
+	settings.EmbeddedCA, settings.ServerLocked = "", false
+	if s.profile != nil {
+		settings.Server, settings.CAFile = s.profile.Server, ""
+		settings.EmbeddedCA, settings.ServerLocked = s.profile.CAPEM, true
+	}
+	return settings
+}
+
 type blob struct {
 	N uint32
 	P *byte
@@ -89,7 +119,11 @@ func LoadPath(path string) (*State, error) {
 	return s, nil
 }
 func (s *State) Save() error {
-	b, e := json.Marshal(s)
+	persisted := *s
+	if s.profile != nil {
+		persisted.Settings.Server, persisted.Settings.CAFile = s.baseServer, s.baseCAFile
+	}
+	b, e := json.Marshal(&persisted)
 	if e != nil {
 		return e
 	}

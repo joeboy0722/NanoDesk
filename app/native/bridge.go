@@ -41,7 +41,7 @@ func Settings(s identity.Settings) {
 	defer fs()
 	ad, fd := str(s.AdminPassword)
 	defer fd()
-	C.ND_Settings(a, b, boolean(s.Unattended), v, st, ad, C.int64_t(s.UploadGiB), boolean(s.Clipboard), boolean(s.RelayOnly), boolean(s.RelayTLSOnly))
+	C.ND_Settings(a, b, boolean(s.Unattended), v, st, ad, C.int64_t(s.UploadGiB), boolean(s.Clipboard), boolean(s.RelayOnly), boolean(s.RelayTLSOnly), boolean(s.ServerLocked))
 }
 func boolean(v bool) C.int {
 	if v {

@@ -1,0 +1,2 @@
+#include "../app.rc"
+30001 RCDATA { "NanoDesk.App.Template/1" }

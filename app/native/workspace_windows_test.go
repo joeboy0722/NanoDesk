@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 	"unsafe"
+
+	"kvm/core/identity"
 )
 
 func TestWorkspaceWindows(t *testing.T) {
@@ -61,6 +63,22 @@ func TestWorkspaceWindows(t *testing.T) {
 		t.Fatal("could not start Win32 UI")
 	}
 	main := classWindow(0, "NDMain")
+	pane := classWindow(main, "NDSettings")
+	if pane == 0 {
+		t.Fatal("missing settings pane")
+	}
+	for _, locked := range []bool{true, false} {
+		Settings(identity.Settings{Server: "https://example.test", ServerLocked: locked, UploadGiB: 1})
+		for _, id := range []uintptr{1201, 1202, 1210} {
+			control := call("GetDlgItem", pane, id)
+			if control == 0 || (call("IsWindowEnabled", control) != 0) == locked {
+				t.Fatalf("connection control %d lock=%v", id, locked)
+			}
+		}
+		if call("IsWindowEnabled", call("GetDlgItem", pane, 1209)) == 0 {
+			t.Fatal("connection mode must remain editable")
+		}
+	}
 	defer func() {
 		for _, sid := range []string{"local", "first", "second", "third"} {
 			Close(sid)

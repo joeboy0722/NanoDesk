@@ -16,10 +16,14 @@ import (
 
 func trustedTLS(s identity.Settings) (*tls.Config, error) {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if s.CAFile != "" {
-		b, err := os.ReadFile(s.CAFile)
-		if err != nil {
-			return nil, err
+	if s.EmbeddedCA != "" || (!s.ServerLocked && s.CAFile != "") {
+		b := []byte(s.EmbeddedCA)
+		if len(b) == 0 {
+			var err error
+			b, err = os.ReadFile(s.CAFile)
+			if err != nil {
+				return nil, err
+			}
 		}
 		pool, err := x509.SystemCertPool()
 		if err != nil {

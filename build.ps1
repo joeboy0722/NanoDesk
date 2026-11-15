@@ -6,7 +6,8 @@ try {
     if (-not $env:GOCACHE) { $env:GOCACHE = Join-Path ([IO.Path]::GetTempPath()) 'nanodesk-go-build' }
     & windres -F pe-x86-64 -i app.rc -o web/app_windows_amd64.syso
     if ($LASTEXITCODE -ne 0) { throw 'Resource compilation failed' }
-    Copy-Item -LiteralPath web/app_windows_amd64.syso -Destination app/app_windows_amd64.syso
+    & windres -F pe-x86-64 -i app/template.rc -o app/app_windows_amd64.syso
+    if ($LASTEXITCODE -ne 0) { throw 'APP resource compilation failed' }
     Copy-Item -LiteralPath web/app_windows_amd64.syso -Destination server/app_windows_amd64.syso
     $guiFlags = "-H windowsgui -s -w -extldflags '-static'"
     & go build -buildvcs=false -ldflags $guiFlags -o NanoDesk-Web.exe ./web

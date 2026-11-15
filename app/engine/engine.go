@@ -132,6 +132,7 @@ func (e *Engine) Settings() identity.Settings {
 	return e.state.Settings
 }
 func (e *Engine) SaveSettings(s identity.Settings) error {
+	s = e.state.EnforceProfile(s)
 	if s.Server != "" {
 		if _, err := signalURL(s.Server); err != nil {
 			return err

@@ -32,6 +32,8 @@ static int settingsScroll;
 static HWND mainWindow, tabs, gear, closeTab, idText, statusText, targetEdit, inboundText, category,
     saveSettings;
 static HWND serverEdit, caEdit, viewEdit, standardEdit, adminEdit, limitEdit, unattendedCheck, clipboardCheck;
+static HWND caBrowse, connectionNotice;
+static bool serverLocked = false;
 static bool running = true, settingsOpen = false, dirty = false, loading = false;
 static int inboundCount;
 static int selectedPage = 0, selectedCategory = 0;
@@ -745,9 +747,10 @@ static void buildMain(HWND h) {
     caEdit = control(settingsPane, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 1202, 204, 202, 302, 30);
     SendMessageW(caEdit, EM_SETLIMITTEXT, 2048, 0);
     settingsField(caEdit, 1);
-    settingsField(control(settingsPane, L"BUTTON", L"選擇檔案…", WS_TABSTOP,
-                          1210, 514, 202, 100, 30), 1);
-    settingsField(label(settingsPane, L"更換伺服器會中斷目前連線。", 204, 254, 410, 32), 1);
+    caBrowse = control(settingsPane, L"BUTTON", L"選擇檔案…", WS_TABSTOP, 1210, 514, 202, 100, 30);
+    settingsField(caBrowse, 1);
+    connectionNotice = label(settingsPane, L"更換伺服器會中斷目前連線。", 204, 254, 410, 32);
+    settingsField(connectionNotice, 1);
     settingsField(label(settingsPane, L"連線模式（排查網路時可切換）", 204, 300, 410, 24), 1);
     modeCombo = control(settingsPane, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 1209, 204, 334, 410, 150);
     for (auto name : {L"自動：直連優先，中繼備援", L"強制中繼", L"僅 TLS 中繼"})
@@ -1838,7 +1841,7 @@ static LRESULT CALLBACK mainProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             showPage();
         } else if (id == 1100)
             save(l == 1);
-        else if (id == 1210 && HIWORD(w) == BN_CLICKED)
+        else if (id == 1210 && HIWORD(w) == BN_CLICKED && !serverLocked)
             chooseCAFile();
         else if (id >= 1201 && id <= 1209 && !loading &&
                  (HIWORD(w) == EN_CHANGE || HIWORD(w) == BN_CLICKED || HIWORD(w) == CBN_SELCHANGE))
@@ -2023,11 +2026,16 @@ extern "C" void ND_MainText(int which, const char *s) {
     }
 }
 extern "C" void ND_Settings(const char *server, const char *ca, int unattended, const char *v, const char *s,
-                            const char *a, int64_t limit, int clip, int relay, int tlsOnly) {
+                            const char *a, int64_t limit, int clip, int relay, int tlsOnly, int locked) {
     loading = true;
+    serverLocked = locked != 0;
+    EnableWindow(serverEdit, !serverLocked);
+    EnableWindow(caEdit, !serverLocked);
+    EnableWindow(caBrowse, !serverLocked);
+    SetWindowTextW(connectionNotice, serverLocked ? L"伺服器網址與 CA 已內建並鎖定。" : L"更換伺服器會中斷目前連線。");
     SendMessageW(modeCombo, CB_SETCURSEL, tlsOnly ? 2 : relay ? 1 : 0, 0);
     SetWindowTextW(serverEdit, wide(server).c_str());
-    SetWindowTextW(caEdit, wide(ca).c_str());
+    SetWindowTextW(caEdit, serverLocked ? L"已內建公開 CA 憑證" : wide(ca).c_str());
     SetWindowTextW(viewEdit, wide(v).c_str());
     SetWindowTextW(standardEdit, wide(s).c_str());
     SetWindowTextW(adminEdit, wide(a).c_str());

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"runtime"
 	"slices"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 
 	"kvm/app/engine"
 	"kvm/app/native"
+	"kvm/core/appprofile"
 	"kvm/core/auth"
 	"kvm/core/capture"
 	"kvm/core/clipboard"
@@ -64,6 +66,19 @@ func main() {
 	}
 	defer unlock()
 	state, err := identity.Load()
+	if err != nil {
+		native.Error(err.Error())
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		native.Error(err.Error())
+		return
+	}
+	profile, err := appprofile.Read(executable)
+	if err == nil && profile != nil {
+		err = state.ApplyProfile(*profile)
+	}
 	if err != nil {
 		native.Error(err.Error())
 		return
@@ -204,7 +219,7 @@ func main() {
 				if err != nil {
 					native.Error("無法儲存設定：" + err.Error())
 				} else {
-					native.Settings(s)
+					native.Settings(e.Settings())
 					native.MainText(1, "設定已儲存")
 					if ev.A != 0 {
 						native.MainText(4, "")

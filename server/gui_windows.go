@@ -101,6 +101,7 @@ type fileDialog struct {
 
 const (
 	idExportCA      = 126
+	idExportApp     = 127
 	idGear          = 101
 	idCloseSettings = 102
 	idTabs          = 103
@@ -161,6 +162,7 @@ type serverGUI struct {
 	start, stop, backup, save, saveStart, certButton, autoStart             uintptr
 	metrics, metricLabels                                                   [3]uintptr
 	titleFont, monoFont, metricFont                                         uintptr
+	exportApp                                                               uintptr
 	highContrast                                                            bool
 	home, settings                                                          []uintptr
 	fields                                                                  []pageControl
@@ -258,6 +260,7 @@ func (g *serverGUI) build() {
 	g.start = g.homeControl("BUTTON", "啟動服務", 0x10000, idStart, 604, 72, 130, 36)
 	g.stop = g.homeControl("BUTTON", "停止服務", 0x10000, idStop, 746, 72, 130, 36)
 	g.backup = g.homeControl("BUTTON", "備份 ID 資料庫…", 0x10000, idBackup, 694, 338, 182, 34)
+	g.exportApp = g.homeControl("BUTTON", "匯出預設連線 APP…", 0x10000, idExportApp, 500, 338, 182, 34)
 	g.logLabel = g.homeControl("STATIC", "服務紀錄", 0, 0, 24, 344, 180, 24)
 	g.logs = g.homeControl("EDIT", "", 0x00800000|0x800|4|0x40|0x00200000|0x10000, 0, 24, 382, 850, 258)
 	win("SendMessageW", g.logs, 0x30, g.monoFont, 1)
@@ -523,6 +526,9 @@ func (g *serverGUI) complete() {
 				continue
 			}
 			switch result.kind {
+			case "app-export":
+				log.Printf("預設連線 APP 已匯出：%s", result.text)
+				showMessage(g.hwnd, "APP 已匯出：\r\n"+result.text+"\r\n\r\n網址與公開 CA 已內建；可將此 EXE 交給使用者直接開啟。", 0x40)
 			case "certificate":
 				g.fill(result.settings)
 				g.dirty = true
@@ -622,6 +628,7 @@ func (g *serverGUI) refresh() {
 	enable(g.start, editable)
 	enable(g.stop, (snapshot.Phase == "starting" || snapshot.Phase == "running") && !g.closing)
 	enable(g.backup, (snapshot.Phase == "stopped" || snapshot.Phase == "running") && !g.busy && !g.closing)
+	enable(g.exportApp, !g.busy && !g.closing)
 }
 func (g *serverGUI) closeWindow() {
 	if g.busy {
@@ -685,6 +692,8 @@ func serverWndProc(h uintptr, msg uint32, w, l uintptr) uintptr {
 			}
 		case id == idExportCA:
 			g.exportCAAction()
+		case id == idExportApp:
+			g.exportAppAction()
 		case id == idCopyCA:
 			if path := getText(g.edits[fieldCA]); path != "" {
 				clipboard.WriteText(path)
@@ -1004,6 +1013,7 @@ func (g *serverGUI) layoutHome(width, height int) int {
 	y += ((len(g.metrics)+columns-1)/columns)*78 + 12
 	put(g.logLabel, 24, y+7, 180, 24)
 	put(g.backup, width-206, y, 182, 34)
+	put(g.exportApp, width-400, y, 182, 34)
 	y += 46
 	height = max(height, y+144)
 	put(g.logs, 24, y, width-48, height-y-24)

@@ -16,7 +16,7 @@ int ND_Init(void);
 int ND_Poll(NDEvent *);
 void ND_MainText(int which, const char *text);
 void ND_Settings(const char *server, const char *ca, int unattended, const char *v, const char *s,
-                 const char *a, int64_t limit, int clipboard, int relay, int tlsOnly);
+                 const char *a, int64_t limit, int clipboard, int relay, int tlsOnly, int locked);
 void ND_InboundBegin(void);
 void ND_InboundAdd(const char *session, const char *device, const char *role, int controller);
 void ND_InboundEnd(void);
