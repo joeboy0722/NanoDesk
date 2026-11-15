@@ -1508,6 +1508,13 @@ struct ChatControls {
 };
 
 static HWND inboundWindow, inboundTabs, inboundDetails, inboundStop;
+static constexpr UINT_PTR inboundNoticeTimer = 0x4e44;
+
+static void releaseInboundNotice(HWND h) {
+    KillTimer(h, inboundNoticeTimer);
+    SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
 static ChatControls inboundChat;
 static std::vector<Inbound> inboundPeers, incomingPeers;
 static std::string selectedInbound;
@@ -1574,6 +1581,16 @@ static LRESULT CALLBACK inboundProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (LRESULT themed = themeMessage(h, msg, w, l))
         return themed;
     switch (msg) {
+    case WM_TIMER:
+        if (w == inboundNoticeTimer) {
+            releaseInboundNotice(h);
+            return 0;
+        }
+        break;
+    case WM_ACTIVATE:
+        if (LOWORD(w) == WA_INACTIVE)
+            releaseInboundNotice(h);
+        break;
     case WM_CREATE:
         inboundTabs = control(h, WC_TABCONTROLW, L"", WS_TABSTOP, 500, 0, 0, 1, 1);
         inboundDetails = label(h, L"", 24, 68, 182, 134);
@@ -1584,6 +1601,10 @@ static LRESULT CALLBACK inboundProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         ((MINMAXINFO *)l)->ptMinTrackSize = {S(590), S(330)};
         return 0;
     case WM_SIZE: {
+        if (w == SIZE_MINIMIZED) {
+            releaseInboundNotice(h);
+            return 0;
+        }
         RECT rc;
         GetClientRect(h, &rc);
         MoveWindow(inboundTabs, S(24), S(8), rc.right - S(48), S(36), TRUE);
@@ -1672,6 +1693,11 @@ extern "C" void ND_InboundAdd(const char *sid, const char *device, const char *r
 
 extern "C" void ND_InboundEnd() {
     auto oldSelection = selectedInbound;
+    bool newConnection = std::any_of(incomingPeers.begin(), incomingPeers.end(), [](const Inbound &peer) {
+        return std::none_of(inboundPeers.begin(), inboundPeers.end(), [&](const Inbound &old) {
+            return old.sid == peer.sid;
+        });
+    });
     bool tabsChanged = incomingPeers.size() != inboundPeers.size();
     for (size_t i = 0; i < inboundPeers.size(); ++i) {
         const auto &peer = inboundPeers[i];
@@ -1695,12 +1721,13 @@ extern "C" void ND_InboundEnd() {
         return;
     }
     if (!inboundWindow) {
-        inboundWindow = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"NDInbound",
+        inboundWindow = CreateWindowExW(WS_EX_APPWINDOW, L"NDInbound",
                           L"NanoDesk — 正在被遠端連線", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                           CW_USEDEFAULT, CW_USEDEFAULT, S(650), S(390), nullptr, nullptr, instance, nullptr);
         if (!inboundWindow)
             return;
         tabsChanged = true;
+        newConnection = true;
     }
     if (tabsChanged) {
         TabCtrl_DeleteAllItems(inboundTabs);
@@ -1715,8 +1742,15 @@ extern "C" void ND_InboundEnd() {
         TabCtrl_SetCurSel(inboundTabs, selected);
     }
     renderInbound(oldSelection != selectedInbound);
-    if (!IsWindowVisible(inboundWindow))
+    // Announce newly authorized sessions once. Routine controller/role updates
+    // must preserve the user's minimized state and normal window stacking.
+    if (newConnection) {
         ShowWindow(inboundWindow, SW_SHOWNOACTIVATE);
+        SetWindowPos(inboundWindow, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        if (!SetTimer(inboundWindow, inboundNoticeTimer, 2000, nullptr))
+            releaseInboundNotice(inboundWindow);
+    }
 }
 
 extern "C" void ND_ChatText(const char *sid, const char *message, int local) {

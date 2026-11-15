@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -128,6 +129,50 @@ func TestWorkspaceWindows(t *testing.T) {
 	if inbound == 0 || call("GetForegroundWindow") == inbound {
 		t.Fatal("inbound window was missing or stole the foreground")
 	}
+	style := call("GetWindowLongPtrW", inbound, ^uintptr(15)) // GWL_STYLE = -16
+	exStyle := func() uintptr { return call("GetWindowLongPtrW", inbound, ^uintptr(19)) }
+	if style&0x20000 == 0 || exStyle()&0x80 != 0 || exStyle()&0x40000 == 0 {
+		t.Fatal("inbound notification is not a normal minimizable taskbar window")
+	}
+	if exStyle()&0x8 == 0 {
+		t.Fatal("new inbound connection did not receive its initial topmost notification")
+	}
+	noticeDeadline := time.Now().Add(3 * time.Second)
+	for exStyle()&0x8 != 0 {
+		if time.Now().After(noticeDeadline) {
+			t.Fatal("inbound notification remained permanently topmost")
+		}
+		Poll()
+		time.Sleep(10 * time.Millisecond)
+	}
+	message(inbound, 0x112, 0xf020, 0) // SC_MINIMIZE
+	if call("IsIconic", inbound) == 0 {
+		t.Fatal("inbound notification could not be minimized")
+	}
+	InboundBegin()
+	InboundAdd("in-a", "2000000001", "admin", true)
+	InboundAdd("in-b", "2000000002", "control", false)
+	InboundEnd()
+	ChatText("in-b", "while minimized", false)
+	if call("IsIconic", inbound) == 0 || exStyle()&0x8 != 0 {
+		t.Fatal("controller, role or chat update restored the minimized notification")
+	}
+	InboundBegin()
+	InboundAdd("in-a", "2000000001", "admin", true)
+	InboundAdd("in-b", "2000000002", "control", false)
+	InboundAdd("in-c", "2000000003", "view", false)
+	InboundEnd()
+	if call("IsIconic", inbound) != 0 || exStyle()&0x8 == 0 {
+		t.Fatal("a newly authorized session did not show its initial notification")
+	}
+	message(inbound, 0x6, 0, 0) // WA_INACTIVE dismisses the temporary topmost state.
+	if exStyle()&0x8 != 0 {
+		t.Fatal("notification stayed topmost after losing activation")
+	}
+	InboundBegin()
+	InboundAdd("in-a", "2000000001", "admin", true)
+	InboundAdd("in-b", "2000000002", "control", false)
+	InboundEnd()
 	inboundBar := classWindow(inbound, "SysTabControl32")
 	checkCount(inboundBar, 2)
 	ChatText("in-b", "only for B", false)
