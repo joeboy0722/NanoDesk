@@ -4,6 +4,7 @@ import (
 	"errors"
 	"golang.org/x/time/rate"
 	"kvm/core/streamtrace"
+	"kvm/core/traffic"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -22,7 +23,7 @@ type ClientConn struct {
 	server       net.Addr
 	peer         net.Addr
 	credentials  RouteCredentials
-	writeMu      sync.Mutex
+	writeMu      traffic.Gate
 	sequence     uint64
 	replay       ReplayWindow
 }
@@ -127,7 +128,9 @@ func (c *ClientConn) decode(data []byte, source net.Addr) (Packet, bool) {
 }
 
 func (c *ClientConn) send(kind Kind, payload []byte) error {
-	c.writeMu.Lock()
+	if err := c.writeMu.Lock(kind != Data || traffic.Priority(payload)); err != nil {
+		return err
+	}
 	defer c.writeMu.Unlock()
 	if kind == Data {
 		if limiter := c.pacer.Load(); limiter != nil {
@@ -196,7 +199,7 @@ func (c *ClientConn) WriteTo(data []byte, address net.Addr) (int, error) {
 func (c *ClientConn) LocalAddr() net.Addr { return c.conn.LocalAddr() }
 func (c *ClientConn) Close() error {
 	var err error
-	c.closeOnce.Do(func() { close(c.done); err = c.conn.Close() })
+	c.closeOnce.Do(func() { close(c.done); c.writeMu.Close(); err = c.conn.Close() })
 	return err
 }
 func (c *ClientConn) SetDeadline(t time.Time) error      { return c.conn.SetDeadline(t) }

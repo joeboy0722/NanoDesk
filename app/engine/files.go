@@ -41,14 +41,19 @@ type receiver struct {
 }
 
 func (r *receiver) reply(kind, message string) {
-	r.peer.mu.Lock()
-	d := r.peer.file
-	r.peer.mu.Unlock()
-	if d != nil {
-		b, _ := json.Marshal(fileMeta{Type: kind, Error: message, Transfer: r.transfer})
-		d.SendText(string(b))
+	b, _ := json.Marshal(fileMeta{Type: kind, Error: message, Transfer: r.transfer})
+	_ = r.peer.sendFileControl(b)
+}
+func (p *Peer) acceptFileAck(data []byte) {
+	var ack fileMeta
+	if json.Unmarshal(data, &ack) == nil {
+		select {
+		case p.fileAck <- ack:
+		default:
+		}
 	}
 }
+
 func (r *receiver) cleanup() {
 	if r.timer != nil {
 		r.timer.Stop()
@@ -311,8 +316,6 @@ drained:
 	if err = p.waitAck("ready", transfer, cancel); err != nil {
 		return err
 	}
-	pace := time.NewTicker(time.Second / 64)
-	defer pace.Stop()
 	buf := make([]byte, 16385)
 	buf[0] = 1
 	var sent int64
@@ -327,24 +330,7 @@ drained:
 		}
 		n, er := f.Read(buf[1:])
 		if n > 0 {
-			select {
-			case <-pace.C:
-			case <-cancel:
-				return fmt.Errorf("已取消")
-			case <-p.engine.ctx.Done():
-				return fmt.Errorf("已結束")
-			}
-			for d.BufferedAmount() > 128*1024 {
-				select {
-				case <-cancel:
-					return fmt.Errorf("已取消")
-				case <-time.After(10 * time.Millisecond):
-				}
-				if d.ReadyState() != webrtc.DataChannelStateOpen {
-					return fmt.Errorf("通道已關閉")
-				}
-			}
-			if err = d.Send(buf[:n+1]); err != nil {
+			if err = p.sendBulk(buf[:n+1], cancel, nil); err != nil {
 				return err
 			}
 			sent += int64(n)

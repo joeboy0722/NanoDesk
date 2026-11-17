@@ -97,6 +97,10 @@ type Peer struct {
 	recv                *receiver
 	sending             bool
 	fileCancel          chan struct{}
+	fileMetaChannel     *webrtc.DataChannel
+	bulk                bulkSender
+	videoBusy           atomic.Int32
+	bulkHold            atomic.Int64
 	fileAck             chan fileMeta
 	remoteLimit         int64
 	lastChat            time.Time
@@ -520,10 +524,8 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 			ice = append(ice, webrtc.ICEServer{URLs: v.URLs, Username: v.Username, Credential: v.Credential})
 		}
 	}
-	api, err := peerAPI(settings, m.ICE)
-	if err != nil {
-		return err
-	}
+	var api *webrtc.API
+	var err error
 	var relayMux pionice.UDPMux
 	var relaySocket *relay.SwitchConn
 	if m.RelayPath != nil {
@@ -534,6 +536,12 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 		ice = nil
 		if !settings.RelayOnly && !settings.RelayTLSOnly && !m.RelayPath.TLS {
 			ice = []webrtc.ICEServer{{URLs: []string{"stun:" + m.RelayPath.Address}}}
+		}
+	}
+	if m.RelayPath == nil {
+		api, relayMux, err = peerAPI(settings, m.ICE)
+		if err != nil {
+			return err
 		}
 	}
 	policy := webrtc.ICETransportPolicyAll
@@ -608,6 +616,13 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 		p.mu.Lock()
 		p.file = file
 		p.mu.Unlock()
+		p.setupFileChannel(file)
+		meta, er := pc.CreateDataChannel("filemeta", nil)
+		if er != nil {
+			p.Close()
+			return er
+		}
+		p.setFileMeta(meta)
 		file.OnMessage(func(m webrtc.DataChannelMessage) {
 			if p.handleClipboardFile(m.Data) {
 				return
@@ -727,6 +742,9 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 								if report.SSRC == uint32(encoding.SSRC) {
 									streamtrace.Emit(streamtrace.Event{Stage: "rtcp.report", Object: p.traceObject(), Value: int64(report.FractionLost), Result: int64(report.TotalLost)})
 									p.videoRate.observe(time.Now(), p.configuredVideoBitrateKbps(), report.FractionLost)
+									if report.FractionLost >= 13 {
+										p.deferBulk(250 * time.Millisecond)
+									}
 								}
 							}
 						}
@@ -745,12 +763,15 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 			switch d.Label() {
 			case "control":
 				p.setControl(d)
+			case "filemeta":
+				p.setFileMeta(d)
 			case "files":
 				p.mu.Lock()
 				p.file = d
 				p.recv = &receiver{peer: p}
 				recv := p.recv
 				p.mu.Unlock()
+				p.setupFileChannel(d)
 				d.OnMessage(func(m webrtc.DataChannelMessage) {
 					if !p.handleClipboardFile(m.Data) {
 						recv.message(m.Data)
@@ -1037,7 +1058,13 @@ func (p *Peer) WriteMessage(kind int, b []byte) error {
 		}
 		streamtrace.Emit(streamtrace.Event{Stage: "transport.source_frame", Object: p.traceObject(), Frame: uint64(binary.BigEndian.Uint32(b[1:5])), Value: int64(len(b) - 5), Result: int64(b[0])})
 		done := streamtrace.Span("transport.write_sample", p.traceObject(), uint64(binary.BigEndian.Uint32(b[1:5])))
+		p.videoBusy.Add(1)
+		if q, ok := p.relayMux.(*mediaMux); ok {
+			release := q.gate.Reserve()
+			defer release()
+		}
 		p.videoWrite.Lock()
+		defer func() { p.videoBusy.Add(-1); p.bulk.signal() }()
 		if p.packetizer == nil {
 			p.packetizer = rtp.NewPacketizer(1200, 0, 0, &codecs.H264Payloader{}, rtp.NewRandomSequencer(), 90000)
 		}
@@ -1091,6 +1118,8 @@ func (p *Peer) Close() error {
 	if !first {
 		return nil
 	}
+	p.bulk.stop()
+	p.stopClipboardReads()
 	if p.engine.services.VideoSink != nil && p.videoGeneration != 0 {
 		p.engine.services.VideoSink.CloseSession(p.sid, p.videoGeneration)
 	}

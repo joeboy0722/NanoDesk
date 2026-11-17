@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 	"kvm/core/identity"
 	"kvm/core/protocol"
@@ -50,10 +51,10 @@ func (d *turnTLSDialer) Dial(_ string, address string) (net.Conn, error) {
 	}
 	return tls.DialWithDialer(&net.Dialer{Timeout: 8 * time.Second}, "tcp", address, d.config.Clone())
 }
-func peerAPI(settings identity.Settings, servers []protocol.ICE) (*webrtc.API, error) {
+func peerAPI(settings identity.Settings, servers []protocol.ICE) (*webrtc.API, ice.UDPMux, error) {
 	cfg, err := trustedTLS(settings)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	allowed := map[string]bool{}
 	for _, server := range servers {
@@ -67,5 +68,17 @@ func peerAPI(settings identity.Settings, servers []protocol.ICE) (*webrtc.API, e
 	var se webrtc.SettingEngine
 	se.SetICEProxyDialer(&turnTLSDialer{allowed: allowed, config: cfg})
 	se.SetSCTPMaxMessageSize(65536)
-	return videoAPI(se)
+	se.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
+	mux, err := ice.NewMultiUDPMuxFromPort(0)
+	if err != nil {
+		return nil, nil, err
+	}
+	prioritized := priorityMux(mux)
+	se.SetICEUDPMux(prioritized)
+	api, err := videoAPI(se)
+	if err != nil {
+		prioritized.Close()
+		return nil, nil, err
+	}
+	return api, prioritized, nil
 }

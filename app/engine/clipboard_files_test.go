@@ -27,20 +27,34 @@ func TestClipboardFilesBidirectional(t *testing.T) {
 		return p
 	}
 	left, right := makePeer("left"), makePeer("right")
-	opened := make(chan struct{}, 2)
+	opened := make(chan struct{}, 4)
 	attach := func(p *Peer, channel *webrtc.DataChannel) {
 		p.mu.Lock()
 		p.file = channel
 		p.mu.Unlock()
+		p.setupFileChannel(channel)
 		channel.OnMessage(func(m webrtc.DataChannelMessage) { p.handleClipboardFile(m.Data) })
 		channel.OnOpen(func() { opened <- struct{}{} })
 	}
-	right.pc.OnDataChannel(func(d *webrtc.DataChannel) { attach(right, d) })
+	right.pc.OnDataChannel(func(d *webrtc.DataChannel) {
+		if d.Label() == "filemeta" {
+			right.setFileMeta(d)
+			d.OnOpen(func() { opened <- struct{}{} })
+		} else {
+			attach(right, d)
+		}
+	})
 	channel, err := left.pc.CreateDataChannel("files", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	attach(left, channel)
+	meta, err := left.pc.CreateDataChannel("filemeta", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left.setFileMeta(meta)
+	meta.OnOpen(func() { opened <- struct{}{} })
 	check := func(err error) {
 		t.Helper()
 		if err != nil {
@@ -65,7 +79,7 @@ func TestClipboardFilesBidirectional(t *testing.T) {
 	check(err)
 	setLocal(right.pc, answer)
 	check(left.pc.SetRemoteDescription(*right.pc.LocalDescription()))
-	for range 2 {
+	for range 4 {
 		select {
 		case <-opened:
 		case <-ctx.Done():

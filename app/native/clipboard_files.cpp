@@ -7,6 +7,10 @@
 #include <new>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <future>
 
 extern "C" int ND_ReadClipboardFile(uintptr_t, int, long long, void *, int);
 extern "C" void ND_ReleaseClipboardFiles(uintptr_t);
@@ -24,13 +28,19 @@ struct VirtualFiles {
     ~VirtualFiles() { if (token) ND_ReleaseClipboardFiles(token); }
 };
 
+struct StreamApartment {
+ std::shared_ptr<void> stop{CreateEventW(nullptr,TRUE,FALSE,nullptr),CloseHandle};
+ ~StreamApartment(){if(stop)SetEvent(stop.get());}
+};
 class FileStream final : public IStream {
-    ULONG refs = 1;
+    std::atomic<ULONG> refs{1};
+    std::mutex positionMutex;
+    std::shared_ptr<StreamApartment> apartment;
     std::shared_ptr<VirtualFiles> files;
     int index;
     long long position = 0;
 public:
-    FileStream(std::shared_ptr<VirtualFiles> files, int index) : files(std::move(files)), index(index) {}
+    FileStream(std::shared_ptr<VirtualFiles> files, int index,std::shared_ptr<StreamApartment> apartment) : apartment(std::move(apartment)),files(std::move(files)), index(index) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
         if (!object) return E_POINTER;
         *object = nullptr;
@@ -46,15 +56,16 @@ public:
         return count;
     }
     HRESULT STDMETHODCALLTYPE Read(void *buffer, ULONG count, ULONG *read) override {
+ std::lock_guard<std::mutex> lock(positionMutex);
         if (read) *read = 0;
         if (!buffer && count) return STG_E_INVALIDPOINTER;
         auto remaining = std::max(0LL, files->items[index].size - position);
         auto requested = static_cast<ULONG>(std::min<long long>(count, remaining));
         ULONG done = 0;
         while (done < requested) {
-            int chunk = static_cast<int>(std::min<ULONG>(requested - done, 8192));
+            int chunk = static_cast<int>(std::min<ULONG>(requested - done, 65536));
             int result = ND_ReadClipboardFile(files->token, index, position, static_cast<char *>(buffer) + done, chunk);
-            if (result != chunk) return STG_E_READFAULT;
+            if (result <= 0 || result > chunk) return STG_E_READFAULT;
             done += result;
             position += result;
             if (read) *read = done;
@@ -62,6 +73,7 @@ public:
         return done == count ? S_OK : S_FALSE;
     }
     HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER offset, DWORD origin, ULARGE_INTEGER *result) override {
+ std::lock_guard<std::mutex> lock(positionMutex);
         long long base = 0;
         if (origin == STREAM_SEEK_CUR) base = position;
         else if (origin == STREAM_SEEK_END) base = files->items[index].size;
@@ -80,8 +92,9 @@ public:
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Clone(IStream **stream) override {
+ std::lock_guard<std::mutex> lock(positionMutex);
         if (!stream) return E_POINTER;
-        auto copy = new (std::nothrow) FileStream(files, index);
+        auto copy = new (std::nothrow) FileStream(files, index,apartment);
         if (!copy) return E_OUTOFMEMORY;
         copy->position = position;
         *stream = copy;
@@ -91,7 +104,7 @@ public:
         if (!target) return E_POINTER;
         if (read) read->QuadPart = 0;
         if (written) written->QuadPart = 0;
-        char buffer[8192];
+        char buffer[65536];
         while (size.QuadPart) {
             ULONG n = 0, out = 0;
             auto hr = Read(buffer, static_cast<ULONG>(std::min<ULONGLONG>(size.QuadPart, sizeof(buffer))), &n);
@@ -113,6 +126,36 @@ public:
     HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
     HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
 };
+
+// The stream is owned by the MTA so Explorer's network reads never execute
+// on the App's STA window thread. Keep that apartment alive until the final
+// stream/clone releases its reference; the clipboard object itself stays STA.
+static HRESULT makeFileStream(std::shared_ptr<VirtualFiles> files,int index,IStream** result){
+ *result=nullptr;
+ try{
+  auto apartment=std::make_shared<StreamApartment>();
+  if(!apartment->stop)return E_OUTOFMEMORY;
+  struct Ready{std::promise<HRESULT> result;IStream* marshaled=nullptr;};
+  auto ready=std::make_shared<Ready>();auto future=ready->result.get_future();
+  auto stop=apartment->stop;
+  std::thread worker([files,index,apartment,stop,ready]()mutable{
+   auto hr=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+   bool initialized=SUCCEEDED(hr);
+   if(initialized){
+    auto object=new(std::nothrow)FileStream(files,index,apartment);
+    if(!object)hr=E_OUTOFMEMORY;
+    else{hr=CoMarshalInterThreadInterfaceInStream(IID_IStream,object,&ready->marshaled);object->Release();}
+   }
+   apartment.reset();
+   ready->result.set_value(hr);
+   WaitForSingleObject(stop.get(),INFINITE);
+   if(initialized)CoUninitialize();
+  });worker.detach();
+  auto hr=future.get();
+  if(FAILED(hr))return hr;
+  return CoGetInterfaceAndReleaseStream(ready->marshaled,IID_IStream,reinterpret_cast<void**>(result));
+ }catch(...){return E_OUTOFMEMORY;}
+}
 
 class FileClipboard final : public IDataObject {
     ULONG refs = 1;
@@ -159,8 +202,9 @@ public:
         if (FAILED(hr)) return hr;
         if (format->cfFormat == contents) {
             if (format->lindex < 0) return DV_E_LINDEX;
-            auto stream = new (std::nothrow) FileStream(files, format->lindex);
-            if (!stream) return E_OUTOFMEMORY;
+            IStream* stream=nullptr;
+            auto created=makeFileStream(files,format->lindex,&stream);
+            if(FAILED(created))return created;
             medium->tymed = TYMED_ISTREAM;
             medium->pstm = stream;
             return S_OK;
@@ -285,6 +329,8 @@ extern "C" long ND_PublishClipboardFiles(void *offer, unsigned long expected) {
 }
 
 extern "C" int ND_TestClipboardObject(uintptr_t token) {
+ auto init=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+ struct Uninitialize{HRESULT h;~Uninitialize(){if(SUCCEEDED(h))CoUninitialize();}} uninit{init};
     auto files = std::make_shared<VirtualFiles>();
     files->token = token;
     files->items.push_back({L"folder", 0, true});
@@ -320,4 +366,28 @@ extern "C" int ND_TestClipboardObject(uintptr_t token) {
     hr = data.pstm->Read(buffer, sizeof(buffer), &read);
     ReleaseStgMedium(&data);
     return hr == S_FALSE && read == 5 && std::memcmp(buffer, "hello", 5) == 0 ? 0 : 7;
+}
+
+extern "C" int ND_TestClipboardStreamWhileSTAWaits(uintptr_t token){
+ auto init=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+ struct Uninitialize{HRESULT h;~Uninitialize(){if(SUCCEEDED(h))CoUninitialize();}} uninit{init};
+ auto files=std::make_shared<VirtualFiles>();files->token=token;files->items.push_back({L"file.txt",5,false});
+ IStream* stream=nullptr;if(FAILED(makeFileStream(files,0,&stream)))return 1;
+ IStream* marshaled=nullptr;auto hr=CoMarshalInterThreadInterfaceInStream(IID_IStream,stream,&marshaled);stream->Release();if(FAILED(hr))return 2;
+ HANDLE done=CreateEventW(nullptr,TRUE,FALSE,nullptr);if(!done){marshaled->Release();return 3;}
+ auto result=std::make_shared<std::atomic<int>>(4);
+ std::thread reader([marshaled,done,result]{
+  auto init=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+  IStream* remote=nullptr;
+  if(SUCCEEDED(init)){
+   if(SUCCEEDED(CoGetInterfaceAndReleaseStream(marshaled,IID_IStream,reinterpret_cast<void**>(&remote)))){
+   char data[5]{};ULONG read=0;auto hr=remote->Read(data,5,&read);remote->Release();
+   if(SUCCEEDED(hr)&&read==5&&std::memcmp(data,"hello",5)==0)*result=0;
+   }
+  }else marshaled->Release();
+  if(SUCCEEDED(init))CoUninitialize();SetEvent(done);
+ });
+ // Deliberately do not pump STA messages while the other apartment reads.
+ if(WaitForSingleObject(done,3000)!=WAIT_OBJECT_0){reader.detach();return 5;}
+ reader.join();CloseHandle(done);return result->load();
 }

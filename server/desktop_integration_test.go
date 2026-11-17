@@ -231,7 +231,8 @@ func testAuthorizedNativeDesktopAndFilePipeline(t *testing.T, shared bool) {
 	if err := a.SendFiles(sid, []string{large}); err != nil {
 		t.Fatal(err)
 	}
-	waitEvent(t, a, "file_status")
+	// Cancel while the batch is still starting. Waiting for a progress event
+	// is too late on a fast link: the entire 4 MiB file may already be saved.
 	a.CancelFiles(sid)
 	limit := time.NewTimer(5 * time.Second)
 	cancelled := false

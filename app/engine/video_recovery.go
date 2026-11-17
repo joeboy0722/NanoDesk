@@ -49,6 +49,7 @@ func (e *Engine) videoLost(sid string) {
 	e.videoMu.Unlock()
 }
 func (e *Engine) videoLostPeer(p *Peer) {
+	p.deferBulk(250 * time.Millisecond)
 	e.videoMu.Lock()
 	defer e.videoMu.Unlock()
 	if e.services.VideoSink != nil {

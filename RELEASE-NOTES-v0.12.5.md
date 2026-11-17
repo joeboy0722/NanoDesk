@@ -18,6 +18,17 @@
 6. 擷取沿用緩衝時提示「來源畫面暫未更新」，並保留靜態桌面的低更新率行為。頻寬、角色權限、控制與剪貼簿功能保留，不修改正式影像封裝或協定版本 2。
 7. 補齊排程、五幀集中交付、工作階段隔離、視窗阻塞、解析度、RTP 回繞／缺包、IDR 重複丟棄與佇列恢復回歸，並整理本機、遠端與十五分鐘長測報告。
 
+## 2026-11-18 傳檔效能更新
+
+- 原生 App 手動傳檔移除每個 16 KiB 區塊的固定等待，解除原本約 1 MiB/s 的程式限速。
+- 複製貼上檔案改為二進位串流、可成長範圍與有界預讀，移除逐個 8 KiB 區塊 JSON/base64 往返等待；控制與確認使用獨立檔案控制通道。
+- **不保留舊版檔案協定相容：控制端與被控端 App 都必須重新下載本次更新的 v0.12.5。僅版本號相同不足以判斷，請以更新日期及 SHA-256 核對。**
+- 畫面優先：原生傳送端與 NanoDesk UDP／TLS Relay 優先交付影像，傳檔採有界緩衝、畫面寫入期間退讓與丟包恢復暫停。更新 Server 才會套用伺服器端佇列優先順序；既有頻寬與角色權限限制保留。
+- Explorer 檔案串流讀取移至 MTA，避免網路讀取占住原生 UI 執行緒；保留取消、撤銷授權、檔案變更檢查與未完成檔案清理。
+- 模擬 50 ms RTT 的 race 測試：手動傳檔約 14.82 MiB/s、複製貼上最新測得約 17.00 MiB/s，皆完成內容比對。這不是公司網路實測；實際速度仍受線路、磁碟及中繼配額影響。
+- 直連、TURN UDP／TLS、NanoDesk UDP／TLS 的檔案內容測試通過，完整 Server race 回歸通過。實際遠端同時傳大檔與動態畫面的驗收尚未完成；已開始的 OS／TLS 寫入及網路設備排隊無法被優先機制中斷。
+- 本項更新適用原生 App；Web 版仍使用其獨立 HTTP 上傳流程。
+
 ## 下載
 
 - **NanoDesk-App.exe** — Windows 原生遠端桌面，控制端與被控端共用，也是伺服器匯出的原始範本；包含本輪串流修正與診斷。
@@ -25,7 +36,7 @@
 - **NanoDesk-Web.exe** — 獨立的 Web 版；同步更新共用桌面產生排程與主機佇列修正，原生觀看端修正只適用 App。
 - **LICENSE** — MIT 授權條款。
 
-App 與 Web 版各自使用獨立連線流程。App 約 11.86 MB，伺服器約 8.32 MB，Web 約 7.97 MB；App 仍超過 8 MB 目標。
+App 與 Web 版各自使用獨立連線流程。App 約 11.93 MB，伺服器約 8.32 MB，Web 約 7.97 MB；App 仍超過 8 MB 目標。
 
 ## 驗證狀態
 
@@ -43,4 +54,5 @@ App 與 Web 版各自使用獨立連線流程。App 約 11.86 MB，伺服器約 
 - [遠端量測與限制](https://github.com/joeboy0722/NanoDesk/blob/v0.12.5/STREAM-FIX-REMOTE-RESULTS.md)
 - [串流診斷指南](https://github.com/joeboy0722/NanoDesk/blob/v0.12.5/STREAM-TRACE.md)
 - [建置體積與 SHA-256](https://github.com/joeboy0722/NanoDesk/blob/v0.12.5/BUILD-SIZES.txt)
+- [傳檔效能與驗證報告](https://github.com/joeboy0722/NanoDesk/blob/v0.12.5/FILE-TRANSFER-PERFORMANCE.md)
 - [MIT LICENSE](https://github.com/joeboy0722/NanoDesk/blob/v0.12.5/LICENSE)

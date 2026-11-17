@@ -10,6 +10,7 @@ int ND_AddClipboardFormat(void *, const wchar_t *, const char *, int);
 void ND_DeleteClipboardFiles(void *);
 long ND_PublishClipboardFiles(void *, unsigned long);
 int ND_TestClipboardObject(uintptr_t);
+int ND_TestClipboardStreamWhileSTAWaits(uintptr_t);
 */
 import "C"
 
@@ -72,4 +73,8 @@ func ND_ReleaseClipboardFiles(token C.uintptr_t) {
 
 func testClipboardObject(read ClipboardFileReader) int {
 	return int(C.ND_TestClipboardObject(C.uintptr_t(cgo.NewHandle(read))))
+}
+
+func testClipboardStreamWhileSTAWaits(read ClipboardFileReader) int {
+	return int(C.ND_TestClipboardStreamWhileSTAWaits(C.uintptr_t(cgo.NewHandle(read))))
 }

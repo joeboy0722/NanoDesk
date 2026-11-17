@@ -158,6 +158,35 @@ func testNativeConnection(t *testing.T, mode string) {
 	if !bytes.Equal(reply.Data, payload) {
 		t.Fatal("fragmented message corrupted")
 	}
+	if mode == "direct" || mode == "relay" || mode == "tls-only" || mode == "shared-pool" || mode == "shared-tls" {
+		// Exercise the production binary clipboard protocol over the selected
+		// encrypted route, without capturing the desktop or injecting input.
+		data := bytes.Repeat([]byte("clipboard-throughput"), 100000)
+		path := filepath.Join(t.TempDir(), "transfer.bin")
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		manifest, err := b.OfferClipboardFiles(opened.Session, []string{path}, int64(len(data)), func() bool { return true })
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(data))
+		start := time.Now()
+		for offset := 0; offset < len(got); {
+			n, err := a.ReadClipboardFile(opened.Session, manifest.ID, 0, int64(offset), got[offset:min(offset+65536, len(got))], func() bool { return true })
+			if err != nil {
+				t.Fatal(offset, err)
+			}
+			if n == 0 {
+				t.Fatal("clipboard read made no progress")
+			}
+			offset += n
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatal("clipboard contents changed over ", mode)
+		}
+		t.Logf("clipboard route=%s bytes=%d elapsed=%s", mode, len(data), time.Since(start))
+	}
 	if mode == "shared-recover" || mode == "shared-tls-disable" {
 		if mode == "shared-tls-disable" {
 			h.mu.Lock()

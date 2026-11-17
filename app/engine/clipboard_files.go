@@ -6,24 +6,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"kvm/core/clipboard"
 	"sync"
 	"time"
-
-	"github.com/pion/webrtc/v4"
-	"kvm/core/clipboard"
 )
 
 const clipboardFileFrame = 4
-const clipboardChunkSize = 8 * 1024
+const clipboardDataFrame = 5
+const clipboardInitialWindow = 256 * 1024
+const clipboardMaxWindow = 8 * 1024 * 1024
 
 type clipboardFileMessage struct {
+	Version int
 	Request uint64
 	Offer   string
 	Item    int
 	Offset  int64
 	Length  int
-	Data    []byte
-	Reply   bool
+	Cancel  bool
 	Failed  bool
 }
 
@@ -33,175 +33,88 @@ type clipboardFiles struct {
 	offerID       string
 	offerSequence uint32
 	relay         func(int, int64, []byte) (int, error)
+	relayItems    []clipboard.FileItem
 	offer         *clipboard.FileOffer
 	allowed       func() bool
 	next          uint64
-	request       uint64
-	reply         chan clipboardFileMessage
+	epoch         uint64
+	jobs          map[uint64]*clipboardJob
+	queue         []*clipboardJob
 	serving       bool
+	windows       []*clipboardWindow
+	readOffer     string
+	readItem      int
+	readNext      int64
+	readLast      time.Time
 }
 
-func (p *Peer) sendClipboardFile(message clipboardFileMessage) error {
-	p.mu.Lock()
-	channel, closed := p.file, p.closed
-	p.mu.Unlock()
-	if closed || channel == nil || channel.ReadyState() != webrtc.DataChannelStateOpen {
-		return fmt.Errorf("剪貼簿檔案通道尚未就緒")
-	}
-	if channel.BufferedAmount() > 128*1024 {
-		return fmt.Errorf("剪貼簿檔案通道忙碌")
-	}
-	data, err := json.Marshal(message)
+func (p *Peer) sendClipboardFile(m clipboardFileMessage) error {
+	m.Version = 2
+	data, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	return channel.Send(append([]byte{clipboardFileFrame}, data...))
+	return p.sendFileControl(append([]byte{clipboardFileFrame}, data...))
 }
-
 func (p *Peer) handleClipboardFile(data []byte) bool {
-	if len(data) == 0 || data[0] != clipboardFileFrame {
+	if len(data) == 0 {
+		return false
+	}
+	if data[0] == clipboardDataFrame {
+		p.receiveClipboardData(data)
+		return true
+	}
+	if data[0] != clipboardFileFrame {
 		return false
 	}
 	var m clipboardFileMessage
-	if len(data) > 16000 || json.Unmarshal(data[1:], &m) != nil {
+	if len(data) > 4096 || json.Unmarshal(data[1:], &m) != nil || m.Version != 2 || m.Request == 0 {
 		return true
 	}
 	f := &p.clipFiles
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if m.Reply {
-		if f.reply != nil && f.request == m.Request {
-			select {
-			case f.reply <- m:
-			default:
-			}
-		}
-		return true
-	}
-	if f.serving || m.Request == 0 || m.Length <= 0 || m.Length > clipboardChunkSize ||
-		m.Offset < 0 || len(m.Data) != 0 {
-		return true
-	}
-	f.serving = true
-	offer, id, allowed, relay := f.offer, f.offerID, f.allowed, f.relay
-	go func() {
-		reply := clipboardFileMessage{Request: m.Request, Reply: true, Failed: true}
-		if (offer != nil || relay != nil) && id == m.Offer && allowed != nil && allowed() {
-			if relay != nil {
-				buf := make([]byte, m.Length)
-				if n, err := relay(m.Item, m.Offset, buf); err == nil && n == len(buf) {
-					reply.Data = buf
-				}
-			} else {
-				reply.Data = readOfferedChunk(offer, m)
-			}
-			f.mu.Lock()
-			current := f.offer == offer && f.offerID == id
-			f.mu.Unlock()
-			if current && allowed() && reply.Data != nil {
-				reply.Failed = false
-			} else {
-				reply.Data = nil
-			}
-		}
+	if m.Failed {
 		f.mu.Lock()
-		f.serving = false
-		p.sendClipboardFile(reply)
+		for _, w := range f.windows {
+			if w.id == m.Request {
+				w.fail(fmt.Errorf("剪貼簿來源已變更或未授權"))
+			}
+		}
 		f.mu.Unlock()
-	}()
+		return true
+	}
+	if m.Cancel {
+		f.mu.Lock()
+		if j := f.jobs[m.Request]; j != nil {
+			j.stop()
+		}
+		f.mu.Unlock()
+		return true
+	}
+	if m.Length <= 0 || m.Length > clipboardMaxWindow || m.Offset < 0 || m.Item < 0 || len(m.Offer) != 32 {
+		return true
+	}
+	f.mu.Lock()
+	if len(f.jobs) >= 3 {
+		f.mu.Unlock()
+		return true
+	}
+	if _, ok := f.jobs[m.Request]; ok {
+		f.mu.Unlock()
+		return true
+	}
+	if f.jobs == nil {
+		f.jobs = map[uint64]*clipboardJob{}
+	}
+	j := &clipboardJob{message: m, epoch: f.epoch, offer: f.offer, relay: f.relay, items: append([]clipboard.FileItem(nil), f.relayItems...), allowed: f.allowed, done: make(chan struct{})}
+	f.jobs[m.Request] = j
+	f.queue = append(f.queue, j)
+	if !f.serving {
+		f.serving = true
+		go p.serveClipboardJobs()
+	}
+	f.mu.Unlock()
 	return true
 }
-
-func readOfferedChunk(offer *clipboard.FileOffer, m clipboardFileMessage) []byte {
-	file, err := offer.Open(m.Item)
-	if err != nil {
-		return nil
-	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || m.Offset > info.Size() || int64(m.Length) > info.Size()-m.Offset {
-		return nil
-	}
-	data := make([]byte, m.Length)
-	if _, err := file.ReadAt(data, m.Offset); err != nil {
-		return nil
-	}
-	after, err := file.Stat()
-	if err != nil || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
-		return nil
-	}
-	return data
-}
-
-func (p *Peer) readClipboardFile(id string, item int, offset int64, dst []byte, allowed func() bool) (int, error) {
-	if len(dst) == 0 {
-		return 0, nil
-	}
-	if !allowed() {
-		return 0, fmt.Errorf("剪貼簿檔案讀取未授權")
-	}
-	f := &p.clipFiles
-	f.readMu.Lock()
-	defer f.readMu.Unlock()
-	if !allowed() {
-		return 0, fmt.Errorf("剪貼簿檔案讀取未授權")
-	}
-	f.mu.Lock()
-	f.next++
-	request := f.next
-	reply := make(chan clipboardFileMessage, 1)
-	f.request, f.reply = request, reply
-	f.mu.Unlock()
-	defer func() {
-		f.mu.Lock()
-		f.reply = nil
-		f.mu.Unlock()
-	}()
-
-	p.mu.Lock()
-	startGeneration := p.relayGeneration
-	p.mu.Unlock()
-	length := min(len(dst), clipboardChunkSize)
-	if err := p.sendClipboardFile(clipboardFileMessage{
-		Request: request, Offer: id, Item: item, Offset: offset, Length: length,
-	}); err != nil {
-		return 0, err
-	}
-	timer := time.NewTimer(5 * time.Second)
-	defer timer.Stop()
-	poll := time.NewTicker(100 * time.Millisecond)
-	defer poll.Stop()
-	extended := false
-	for {
-		select {
-		case m := <-reply:
-			if !allowed() || m.Failed || len(m.Data) != length {
-				return 0, fmt.Errorf("剪貼簿檔案讀取失敗")
-			}
-			return copy(dst, m.Data), nil
-		case <-timer.C:
-			p.mu.Lock()
-			recovering := !p.closed && (p.relayRecovering || p.relayGeneration != startGeneration)
-			p.mu.Unlock()
-			if recovering && !extended {
-				extended = true
-				timer.Reset(15 * time.Second)
-				continue
-			}
-			return 0, fmt.Errorf("剪貼簿檔案讀取逾時")
-		case <-poll.C:
-			p.mu.Lock()
-			closed := p.closed
-			p.mu.Unlock()
-			if closed || !allowed() {
-				return 0, io.ErrClosedPipe
-			}
-		case <-p.engine.ctx.Done():
-			return 0, io.ErrClosedPipe
-		}
-	}
-}
-
 func (e *Engine) OfferClipboardFiles(sid string, paths []string, limit int64, allowed func() bool) (*clipboard.ClipboardManifest, error) {
 	p := e.get(sid)
 	if p == nil {
@@ -225,6 +138,8 @@ func (e *Engine) OfferClipboardFiles(sid string, paths []string, limit int64, al
 	}
 	f := &p.clipFiles
 	f.mu.Lock()
+	f.invalidateOfferLocked()
+	f.relayItems = nil
 	f.offerID, f.offer, f.allowed, f.offerSequence, f.relay = m.ID, offer, allowed, 0, nil
 	f.mu.Unlock()
 	return m, nil
@@ -234,6 +149,8 @@ func (e *Engine) ClearClipboardFiles(sid string) {
 	if p := e.get(sid); p != nil {
 		f := &p.clipFiles
 		f.mu.Lock()
+		f.invalidateOfferLocked()
+		f.relayItems = nil
 		f.offerID, f.offer, f.allowed, f.offerSequence, f.relay = "", nil, nil, 0, nil
 		f.mu.Unlock()
 	}
@@ -359,9 +276,12 @@ func (p *Peer) RelayNativeClipboardFiles(manifest *clipboard.ClipboardManifest, 
 	f := &p.clipFiles
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.invalidateOfferLocked()
+	f.relayItems = nil
 	f.offer, f.offerSequence = nil, 0
 	f.offerID, f.allowed, f.relay = "", nil, nil
 	if manifest != nil {
 		f.offerID, f.allowed, f.relay = manifest.ID, allowed, read
+		f.relayItems = append([]clipboard.FileItem(nil), manifest.Items...)
 	}
 }

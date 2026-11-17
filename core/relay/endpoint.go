@@ -6,6 +6,7 @@ import (
 	"errors"
 	"golang.org/x/time/rate"
 	"kvm/core/streamtrace"
+	"kvm/core/traffic"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -43,9 +44,10 @@ type routeShard struct {
 }
 
 type outgoing struct {
-	revoked *atomic.Bool
-	data    []byte
-	address net.Addr
+	priority bool
+	revoked  *atomic.Bool
+	data     []byte
+	address  net.Addr
 }
 
 // Endpoint owns a single socket shared by independently authenticated routes.
@@ -257,6 +259,20 @@ func (e *Endpoint) enqueueLocked(r *route, kind Kind, payload []byte, address ne
 		return
 	}
 	if len(r.queue) >= 32 {
+		// Media can replace queued bulk, which SCTP will retransmit. Keep
+		// the route and global queue bounds unchanged.
+		if kind != Data || traffic.Priority(payload) {
+			last := len(r.queue) - 1
+			if !r.queue[last].priority {
+				r.queue[last] = outgoing{}
+				r.queue = r.queue[:last]
+				e.queued.Add(-1)
+				e.traffic.dropped.Add(1)
+				streamtrace.Emit(streamtrace.Event{Stage: "relay.server_bulk_evicted"})
+			}
+		}
+	}
+	if len(r.queue) >= 32 {
 		e.traffic.dropped.Add(1)
 		streamtrace.Emit(streamtrace.Event{Stage: "relay.server_route_queue_drop"})
 		return
@@ -272,7 +288,16 @@ func (e *Endpoint) enqueueLocked(r *route, kind Kind, payload []byte, address ne
 			break
 		}
 	}
-	r.queue = append(r.queue, outgoing{revoked: r.revoked, data: data, address: address})
+	packet := outgoing{priority: kind != Data || traffic.Priority(payload), revoked: r.revoked, data: data, address: address}
+	index := len(r.queue)
+	if packet.priority {
+		for index > 0 && !r.queue[index-1].priority {
+			index--
+		}
+	}
+	r.queue = append(r.queue, outgoing{})
+	copy(r.queue[index+1:], r.queue[index:])
+	r.queue[index] = packet
 	if !r.scheduled {
 		r.scheduled = true
 		e.ready <- r

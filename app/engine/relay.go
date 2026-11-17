@@ -52,10 +52,12 @@ func relayPeerAPI(path *protocol.RelayPath, caller bool, config identity.Setting
 		mux = ice.NewMultiUDPMuxDefault(direct, mux)
 	}
 	var settings webrtc.SettingEngine
+	mux = priorityMux(mux)
 	settings.SetICEUDPMux(mux)
 	settings.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4, webrtc.NetworkTypeUDP6})
 	settings.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	settings.SetSCTPMaxMessageSize(65536)
+	settings.SetSCTPMaxReceiveBufferSize(8 * 1024 * 1024)
 	settings.SetICETimeouts(5*time.Second, 25*time.Second, time.Second)
 	api, err := videoAPI(settings)
 	if err != nil {

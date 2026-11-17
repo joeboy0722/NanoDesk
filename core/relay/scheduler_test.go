@@ -52,3 +52,24 @@ func TestRelayRoundRobinAndRateLimit(t *testing.T) {
 		t.Fatal("rate limit did not reject excess data")
 	}
 }
+
+func TestRelayMediaOvertakesAndEvictsQueuedBulk(t *testing.T) {
+	e := &Endpoint{ready: make(chan *route, 256)}
+	r := &route{credentials: RouteCredentials{Generation: 1}, revoked: &atomic.Bool{}}
+	address := &net.UDPAddr{Port: 1}
+	for range 32 {
+		e.enqueueLocked(r, Data, []byte{23, 1}, address)
+	}
+	e.enqueueLocked(r, Data, []byte{128, 2}, address)
+	if len(r.queue) != 32 || e.queued.Load() != 32 || e.traffic.dropped.Load() != 1 {
+		t.Fatal("media admission broke queue bounds")
+	}
+	if !r.queue[0].priority {
+		t.Fatal("queued files blocked media")
+	}
+	for _, p := range r.queue[1:] {
+		if p.priority {
+			t.Fatal("bulk order changed")
+		}
+	}
+}
