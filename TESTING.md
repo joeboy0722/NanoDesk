@@ -1,5 +1,11 @@
 # NanoDesk 驗證記錄
 
+## 2026-11-17 串流診斷與本機故障重現
+
+遠端階段亦已完成：固定 HTML 動態負載的 UDP／觀看端 TLS、雙觀看者與有效可見視窗十五分鐘長測，並取得被控端完整 JSONL。確認 33 ms 輪詢放大產生間隔，以及觀看佇列溢位／IDR 節流放大停頓；測試機外部畫面停止事件獨立註記。模式覆蓋限制、診斷統計修正、具體數據與回歸結果見 [STREAM-TRACE-REMOTE-RESULTS.md](STREAM-TRACE-REMOTE-RESULTS.md)。
+
+新增預設關閉的 `NANODESK_STREAM_TRACE_DIR` 診斷、各階段事件、每秒百分位摘要、RTP 關聯及離線停頓分析。完成三分鐘合成靜態／動態基準、三種碼率動態／雜訊矩陣、原生視窗十秒呈現驗證，以及缺包時間窗口、慢傳送、共用觀看佇列、編碼器重建故障測試。具體數據、回歸限制與尚未執行的遠端測試見 [STREAM-TRACE-RESULTS.md](STREAM-TRACE-RESULTS.md)，使用方式見 [STREAM-TRACE.md](STREAM-TRACE.md)。沒有修改既有串流控制策略，當時尚未開始實際遠端測試；後續結果見上方遠端階段紀錄。
+
 ## 2026-11-15 v0.12.0 預設連線 APP 匯出
 
 - 伺服器匯出實際建置的 APP 範本、內嵌設定讀回、重新匯出、保留其他 PE 資源及不修改來源範本測試通過。無效範本、損壞設定、憑證與網址不符及受保護目的地會拒絕匯出。
@@ -188,3 +194,43 @@
 GUI 可啟動並讀取主控台的可存取性樹。啟用視窗後再試，畫面擷取仍回報 `window capture timed out`，先前點擊也回報 `coordinate input geometry is unavailable`，因此設定頁的實際操作及視覺驗收尚未完成。
 
 使用者已指示暫緩第二台 Windows、實體多網卡與跨 NAT 驗收，這些項目記為暫緩。實體頻寬滿載測試也尚無結果。交付執行檔已重新建置，大小與 SHA256 見 [BUILD-SIZES.txt](BUILD-SIZES.txt)。
+
+### 2026-11-17 串流修正候選版
+
+已實作單一 deadline timer、來源時間 RTP 時鐘、工作階段獨立 MF 解碼 worker、有界快照／WM_APP 通知、即時有界組幀器與 epoch IDR 恢復。來源沿用緩衝有獨立狀態提示。完整變更、對照與未驗收限制見 [STREAM-FIX-RESULTS.md](STREAM-FIX-RESULTS.md)。
+
+修改元件 `go test -race ./app/engine ./core/desktop ./app/native` 通過。原生視窗停止 Poll 兩秒仍解碼 61 幀，恢復後提交最新快照約 0.538 ms，快照池三張；最小化／還原、縮放、五幀集中交付、兩工作階段、解析度切換與世代隔離通過。RTP 回繞、STAP-A、FU-A 大 IDR、遺失／無後續封包到期、IDR 重複本地丟棄與 250/500ms 請求間隔測試通過。34ms 預算的控制時間測試與實際 producer 測試不再出現 66ms ticker 量化，保留頻寬與極端雜訊回歸。
+
+完整 `go test -race ./... -count=1 -timeout 180s` 的其餘套件通過，仍因既有 GDI `BitBlt invalid handle` 測試失敗而退出非零；未跳過或放寬。`go vet ./...` 仍有既有 input、clipboard、server unsafe.Pointer 警告。紀錄在 `nanodesk-diagnostics/fix-full-final.log` 與 `fix-vet.log`。
+
+App、Web 候選版已獨立建置，保留正式 EXE；App 約 11.85MB、Web 約 7.97MB。另提供候選 ZIP 與自動設定診斷輸出目錄的 Start-Candidate.cmd。1920x1080 實際遠端效能、純 TLS、故障網路一秒恢復與十五分鐘長測尚待使用者準備完成，不宣稱遠端已達 28FPS 或全部驗收完成。
+
+### 2026-11-18 修正候選版遠端驗收
+
+已完成觀看端 UDP、觀看端 TLS、共同 180 秒雙觀看者，以及兩端設定僅 TLS 後的完整 900 秒長測，均為原生視窗只觀看。詳見 [STREAM-FIX-REMOTE-RESULTS.md](STREAM-FIX-REMOTE-RESULTS.md)。
+
+UDP 與雙觀看者約 23.3FPS，沒有超過 500ms 的新畫面間隔。觀看端 TLS 三分鐘有三次大影格傳輸／預算事件，最大新畫面間隔約 0.833 秒；已以來源毫秒與 RTP timestamp 固定偏移匹配主機／觀看端事件，未直接相減兩端時鐘。
+
+兩端設定 TLS 的十五分鐘窗口成功解碼與新畫面提交各 20687 幀、22.986FPS、新畫面 P95 56.938ms，11 次超過 500ms、最大 1.312 秒，零解碼錯誤。完整程序 private bytes 約 167.23–173.90MiB，未見持續上升。**未達 28FPS／P95 50ms／沒有 500ms 停頓驗收**；診斷工具 PASS 不能代替本計畫驗收。主機新設定截圖已取得，後段實際主機路徑與 IDR 接受仍待完整主機 JSONL；Relay 服務端計數缺少。
+
+主機檔的 DXGI AcquireNextFrame P50 19.044ms、P95 35.496ms，Capture P50 26.010ms，Encode P50 8.146ms；deadline 額外遲到 P95 僅 0.726ms。剩餘穩態 FPS 限制已定位至擷取等待，來源真實 Present 節奏仍需新診斷，未宣稱硬體故障。
+
+另建置候選 v2：新恢復 epoch 立即清除單一 session 待解碼佇列，拒絕晚到舊 epoch，並增加 DXGI Present／累積更新／GPU讀回分段診斷。v2 的 Engine、Native、Desktop race 回歸及 GUI blocked／五幀 burst／世代／epoch／解析度測試通過；原生 UI 全域生命週期測試使用子程序隔離，避免 OLE apartment 污染後續 MTA 編碼器測試。focused vet 與 diff check 通過。Capture 測試仍重現既有 GDI invalid handle，未跳過／放寬。v2 尚未部署到遠端，上述遠端成績屬原候選版。
+
+### 2026-11-18 完整長測主機配對與補正
+
+更新後 `remote-host/stream-10544-3026905614.jsonl` 已完整涵蓋長測。配對全部 21376 個接收樣本，主機 929 筆 route 事件全為 TLS，確認雙端實際 TLS。每次停頓的主機／觀看端時間線及兩張未恢復 IDR 的封包集合見 [STREAM-FIX-REMOTE-RESULTS.md](STREAM-FIX-REMOTE-RESULTS.md)。
+
+前四次約 0.81–0.85 秒停頓伴隨主機 TLS Write 約 0.38–0.58 秒阻塞與三格主機傳送佇列溢位。相鄰 RTP 寫入完成間隔小，不能排除完整 Write 呼叫本身阻塞；分析器已加對應回歸與零耗時事件統計檢查。
+
+另確認影格 27757 是新 IDR，與 queue_overflow 同時被舊邏輯丟掉。v2 已改為清除舊 GOP 後保留當前可用的新 IDR，不再為它多請求一張；容量、頻寬與權限保留。新增滿佇列新 IDR 回歸，Desktop、Relay、Engine、Native race 測試通過。另加 SwitchConn 接收／佇列等待／丟棄診斷，以及完整新 IDR 淘汰舊幀時的明確組幀丟棄事件。
+
+使用者補充測試機 USB 網卡較慢且不穩定；目前沒有已確認可用的穩定連線供對照。網路因素與編碼／擷取因素分開保留，未直接宣稱 USB 網卡是唯一原因，未自行修改網路、驅動或電源設定。v2 已重新建置獨立 App／Web EXE 與 App ZIP，正式版和已測候選保留；v2 尚待遠端驗收。
+
+### v0.12.5 預發行建置驗證
+
+2026-11-18 三個 release EXE 由目前修正源碼重新建置，雜湊與位元組數更新至 BUILD-SIZES.txt；先前正式 EXE 保留於本機忽略的備份目錄。
+
+`go test -race ./... -count=1 -timeout 180s` 已完成：除既有 GDI `TestGDIRepeatedInitReleasesHandles` 的 BitBlt invalid handle 外，其餘套件（含 Server／Web transport）通過；未跳過／放寬此測試。七項 Python 診斷分析測試、JavaScript syntax check 與九項前端測試通過。整體 vet 仍回報既有 input／clipboard／server Win32 unsafe.Pointer 警告，修改元件的 focused vet 通過。原生 GUI／MF 與新增主機 IDR 保留回歸的結果見前述紀錄。
+
+本版為 Beta Preview；發行包含長測後新增的 IDR 保留、epoch 邊界與擷取／Relay 診斷。先前遠端約 23FPS 與 TLS 停頓結果保留，尚未替本版重新宣告遠端驗收通過。發行說明見 RELEASE-NOTES-v0.12.5.md。

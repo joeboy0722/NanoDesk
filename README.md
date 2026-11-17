@@ -31,6 +31,12 @@ App 與伺服器使用協定版本 2，需一起更新。原有 Release 可保�
 
 無人值守預設關閉。App 身分與設定以 Windows DPAPI 加密，位於 `%LOCALAPPDATA%\NanoDesk\state.bin`。App 需持續執行並位於可操作的互動桌面。
 
+## 串流修正與診斷（v0.12.5 預發行）
+
+串流改用完整產生週期的 deadline timer，原生觀看端按工作階段獨立解碼，並加入有界 RTP 組幀、來源時間 RTP 時鐘及 IDR 恢復世代管理。主機傳送佇列溢位時會保留當前新 IDR，降低不必要的恢復等待；頻寬保護仍會在壅塞時降低更新率。
+
+診斷預設關閉，設定 `NANODESK_STREAM_TRACE_DIR` 後輸出有界非同步 JSONL，不保存畫面、H.264 內容或登入密碼。使用方法見 [串流量測指南](STREAM-TRACE.md)，修正與實測限制見 [本機驗證](STREAM-FIX-RESULTS.md)及[遠端驗收](STREAM-FIX-REMOTE-RESULTS.md)。目前遠端約 23 FPS，TLS 長測仍有超過 500ms 的停頓，尚未達全部效能驗收目標。
+
 ## 建置與驗證
 
 Windows x64、Go 1.25.6、MinGW-w64 GCC／g++／windres，啟用 CGO，系統需有 Media Foundation 與 Direct3D 11。
