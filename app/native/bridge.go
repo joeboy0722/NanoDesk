@@ -10,6 +10,7 @@ import "C"
 
 import (
 	"kvm/core/identity"
+	"kvm/core/streamtrace"
 	"unsafe"
 )
 
@@ -26,7 +27,9 @@ func str(s string) (*C.char, func()) {
 func Init() bool { return C.ND_Init() != 0 }
 func Poll() (Event, int) {
 	var v C.NDEvent
+	done := streamtrace.Span("ui.poll", 0, 0)
 	result := int(C.ND_Poll(&v))
+	done(0, int64(result))
 	return Event{int(v.kind), int(v.a), int(v.b), float64(v.x), float64(v.y), C.GoString(&v.session[0]), C.GoString(&v.text[0])}, result
 }
 func MainText(which int, s string) { p, f := str(s); defer f(); C.ND_MainText(C.int(which), p) }
@@ -97,7 +100,10 @@ func Frame(sid string, b []byte) int {
 	}
 	p, f := str(sid)
 	defer f()
-	return int(C.ND_Frame(p, (*C.uchar)(unsafe.Pointer(&b[0])), C.int(len(b))))
+	done := streamtrace.Span("viewer.decode_total", 0, 0)
+	result := int(C.ND_Frame(p, (*C.uchar)(unsafe.Pointer(&b[0])), C.int(len(b))))
+	done(int64(len(b)), int64(result))
+	return result
 }
 func Panel(sid, s string, members bool) {
 	p, f := str(sid)
@@ -168,4 +174,68 @@ func ChatError(sid, message string) {
 	b, fb := str(message)
 	defer fb()
 	C.ND_ChatText(a, b, -1)
+}
+
+func FrameTraced(sid string, b []byte, object, frame uint64) int {
+	if streamtrace.Enabled() {
+		p, f := str(sid)
+		raw := C.ND_TraceFrame(p, C.ulonglong(frame))
+		f()
+		streamtrace.Emit(streamtrace.Event{Stage: "viewer.decoder_link", Object: object, Frame: frame, Value: int64(streamtrace.NativeObject(uint64(raw)))})
+	}
+	return Frame(sid, b)
+}
+
+func testDecoderFeedTraced(p unsafe.Pointer, b []byte, object, frame uint64) (int, int, int) {
+	if streamtrace.Enabled() {
+		C.ND_TestDecoderTrace(p, C.ulonglong(frame))
+		streamtrace.Emit(streamtrace.Event{Stage: "viewer.decoder_link", Object: object, Frame: frame, Value: int64(streamtrace.NativeObject(uint64(uintptr(p))))})
+	}
+	return testDecoderFeed(p, b)
+}
+
+func testShowWindow() bool { return C.ND_TestShowWindow() != 0 }
+func testRenderCounts(sid string) (uint64, uint64) {
+	p, f := str(sid)
+	defer f()
+	return uint64(C.ND_TestPaintCount(p)), uint64(C.ND_TestPresentCount(p))
+}
+
+func videoOpen(sid string, generation uint64) {
+	p, f := str(sid)
+	defer f()
+	C.ND_VideoOpen(p, C.ulonglong(generation))
+}
+func videoClose(sid string, generation uint64) {
+	p, f := str(sid)
+	defer f()
+	C.ND_VideoClose(p, C.ulonglong(generation))
+}
+func videoPublish(sid string, generation uint64, decoder unsafe.Pointer) int {
+	p, f := str(sid)
+	defer f()
+	return int(C.ND_VideoPublish(p, C.ulonglong(generation), decoder))
+}
+func decoderTag(p unsafe.Pointer, frame uint64) { C.ND_TestDecoderTrace(p, C.ulonglong(frame)) }
+func decoderReset(p unsafe.Pointer)             { C.ND_DecoderReset(p) }
+
+func testVideoState(sid string) (uint64, uint64, uint64) {
+	p, f := str(sid)
+	defer f()
+	return uint64(C.ND_TestShownFrame(p)), uint64(C.ND_TestPendingVideo(p)), uint64(C.ND_TestVideoPool(p))
+}
+func testVideoWindow(sid string, mode int) {
+	p, f := str(sid)
+	defer f()
+	C.ND_TestVideoWindow(p, C.int(mode))
+}
+
+func SourceState(sid string, reused bool) {
+	p, f := str(sid)
+	defer f()
+	var value C.int
+	if reused {
+		value = 1
+	}
+	C.ND_SourceState(p, value)
 }

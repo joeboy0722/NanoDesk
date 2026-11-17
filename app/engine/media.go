@@ -4,6 +4,7 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/interceptor/pkg/nack"
 	"github.com/pion/webrtc/v4"
+	"kvm/core/streamtrace"
 )
 
 func videoMediaStack() (*webrtc.MediaEngine, *interceptor.Registry, error) {
@@ -17,6 +18,9 @@ func videoMediaStack() (*webrtc.MediaEngine, *interceptor.Registry, error) {
 	if err := webrtc.RegisterDefaultInterceptorsWithOptions(media, registry,
 		webrtc.WithNackGeneratorOptions(nack.GeneratorMaxNacksPerPacket(3))); err != nil {
 		return nil, nil, err
+	}
+	if streamtrace.Enabled() {
+		registry.Add(traceFactory{})
 	}
 	return media, registry, nil
 }

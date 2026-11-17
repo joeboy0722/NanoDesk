@@ -14,11 +14,13 @@ type Monitor struct {
 
 // Frame 捕獲到的單一畫面訊框
 type Frame struct {
-	Width     int    // 訊框寬度
-	Height    int    // 訊框高度
-	Data      []byte // 原始 32-bit BGRA/RGBA 像素緩衝區
-	Pitch     int    // 每一列 (Row) 的位元組步長
-	Timestamp int64  // 捕獲的時間戳記 (微秒)
+	Reused         bool
+	LastFreshMicro int64
+	Width          int    // 訊框寬度
+	Height         int    // 訊框高度
+	Data           []byte // 原始 32-bit BGRA/RGBA 像素緩衝區
+	Pitch          int    // 每一列 (Row) 的位元組步長
+	Timestamp      int64  // 捕獲的時間戳記 (微秒)
 }
 
 // Capturer 螢幕擷取引擎的統一抽象介面

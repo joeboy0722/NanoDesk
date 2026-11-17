@@ -230,11 +230,12 @@ func (g *GDICapturer) CaptureFrame(monitorIdx int) (*Frame, error) {
 	}
 
 	return &Frame{
-		Width:     m.Width,
-		Height:    m.Height,
-		Data:      ctx.buf,
-		Pitch:     m.Width * 4,
-		Timestamp: time.Now().UnixMicro(),
+		Width:          m.Width,
+		Height:         m.Height,
+		Data:           ctx.buf,
+		Pitch:          m.Width * 4,
+		Timestamp:      time.Now().UnixMicro(),
+		LastFreshMicro: time.Now().UnixMicro(),
 	}, nil
 }
 

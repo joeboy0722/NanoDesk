@@ -3,6 +3,7 @@ package relay
 import (
 	"errors"
 	"golang.org/x/time/rate"
+	"kvm/core/streamtrace"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -130,11 +131,14 @@ func (c *ClientConn) send(kind Kind, payload []byte) error {
 	defer c.writeMu.Unlock()
 	if kind == Data {
 		if limiter := c.pacer.Load(); limiter != nil {
+			paceDone := streamtrace.Span("relay.pace", 0, 0)
 			reservation := limiter.ReserveN(time.Now(), len(payload)+HeaderSize+TagSize)
 			if !reservation.OK() {
 				return errors.New("relay packet exceeds pacing burst")
 			}
-			if delay := reservation.Delay(); delay > 0 {
+			delay := reservation.Delay()
+			streamtrace.Emit(streamtrace.Event{Stage: "relay.pace_planned", DurationUS: delay.Microseconds(), Value: int64(len(payload))})
+			if delay > 0 {
 				timer := time.NewTimer(delay)
 				select {
 				case <-timer.C:
@@ -144,6 +148,7 @@ func (c *ClientConn) send(kind Kind, payload []byte) error {
 					return net.ErrClosed
 				}
 			}
+			paceDone(int64(len(payload)), 0)
 		}
 	}
 	if c.sequence == ^uint64(0) {
@@ -154,7 +159,13 @@ func (c *ClientConn) send(kind Kind, payload []byte) error {
 	if err != nil {
 		return err
 	}
+	writeDone := streamtrace.Span("relay.write", 0, 0)
 	_, err = c.conn.WriteTo(b, c.server)
+	result := int64(0)
+	if err != nil {
+		result = 1
+	}
+	writeDone(int64(len(b)), result)
 	return err
 }
 

@@ -31,3 +31,10 @@ state.bin
 
 # Local live-session diagnostics, identities and executable archives
 nanodesk-diagnostics/
+
+# Isolated diagnostic build cache
+.trace-cache/
+
+# Python analysis caches
+__pycache__/
+*.pyc

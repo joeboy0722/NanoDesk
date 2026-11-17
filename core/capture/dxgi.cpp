@@ -1,3 +1,4 @@
+#include "../streamtrace/native.h"
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -22,6 +23,7 @@ struct DXGIMonitorContext {
     IDXGIOutput1* pOutput1;
     IDXGIOutputDuplication* pDup;
     ID3D11Texture2D* pStagingTexture;
+    LONGLONG traceLastPresent = 0;
 };
 
 static std::vector<DXGIMonitorContext> g_monitors;
@@ -192,15 +194,41 @@ int DXGI_CaptureFrame(int idx, unsigned char* outPixels, int timeoutMs) {
     if (idx < 0 || idx >= (int)g_monitors.size()) return -1;
     DXGIMonitorContext& m = g_monitors[idx];
 
-    DXGI_OUTDUPL_FRAME_INFO frameInfo;
+    DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
     IDXGIResource* pDesktopResource = NULL;
 
-    HRESULT hr = m.pDup->AcquireNextFrame(timeoutMs, &frameInfo, &pDesktopResource);
+    HRESULT hr;{NDTraceSpan trace("capture.acquire",&m);hr=m.pDup->AcquireNextFrame(timeoutMs, &frameInfo, &pDesktopResource);trace.result=hr;}
     if (hr == DXGI_ERROR_WAIT_TIMEOUT || hr == 0x087A0001) {
         return 0; // 超時，畫面無變更
     }
     if (FAILED(hr)) {
         return -2; // 嚴重錯誤 (可能發生模式切換)
+    }
+
+    if (ndTraceEnabled()) {
+        LARGE_INTEGER frequency = {}, now = {};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&now);
+        const LONGLONG present = frameInfo.LastPresentTime.QuadPart;
+        const auto object = reinterpret_cast<uintptr_t>(&m);
+        const long long flags = (present != 0 ? 1 : 0) |
+            (frameInfo.LastMouseUpdateTime.QuadPart != 0 ? 2 : 0) |
+            (frameInfo.PointerShapeBufferSize != 0 ? 4 : 0);
+        ND_StreamTrace(const_cast<char*>("capture.frame_info"), object, present,
+            0, frameInfo.AccumulatedFrames, flags);
+        if (present > 0 && frequency.QuadPart > 0) {
+            const auto micros = [&frequency](LONGLONG ticks) {
+                return (ticks / frequency.QuadPart) * 1000000 +
+                    (ticks % frequency.QuadPart) * 1000000 / frequency.QuadPart;
+            };
+            if (now.QuadPart >= present)
+                ND_StreamTrace(const_cast<char*>("capture.desktop_age"), object, present,
+                    micros(now.QuadPart - present), 0, 0);
+            if (m.traceLastPresent > 0 && present > m.traceLastPresent)
+                ND_StreamTrace(const_cast<char*>("capture.desktop_interval"), object, present,
+                    micros(present - m.traceLastPresent), 0, 0);
+            m.traceLastPresent = present;
+        }
     }
 
     // 取得桌面 Texture
@@ -219,12 +247,12 @@ int DXGI_CaptureFrame(int idx, unsigned char* outPixels, int timeoutMs) {
         pAcquiredTexture->Release(); m.pDup->ReleaseFrame(); return -5;
     }
     // 複製到常駐 Staging Texture
-    m.pContext->CopyResource(m.pStagingTexture, pAcquiredTexture);
+    {NDTraceSpan trace("capture.copy_resource",&m);m.pContext->CopyResource(m.pStagingTexture, pAcquiredTexture);}
     pAcquiredTexture->Release();
 
     // 映射記憶體讓 CPU 讀取像素
     D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = m.pContext->Map(m.pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+    {NDTraceSpan trace("capture.map",&m);hr = m.pContext->Map(m.pStagingTexture, 0, D3D11_MAP_READ, 0, &mapped);trace.result=hr;}
     if (FAILED(hr)) {
         m.pDup->ReleaseFrame();
         return -4;
@@ -234,7 +262,7 @@ int DXGI_CaptureFrame(int idx, unsigned char* outPixels, int timeoutMs) {
     int w = m.width;
     int h = m.height;
 
-    CopyRotatedPixels(src,outPixels,w,h,m.rotation,mapped.RowPitch);
+    {NDTraceSpan trace("capture.pixel_copy",&m);CopyRotatedPixels(src,outPixels,w,h,m.rotation,mapped.RowPitch);}
 
     m.pContext->Unmap(m.pStagingTexture, 0);
     m.pDup->ReleaseFrame();

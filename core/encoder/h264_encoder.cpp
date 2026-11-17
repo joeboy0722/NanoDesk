@@ -1,3 +1,4 @@
+#include "../streamtrace/native.h"
 #include "h264_encoder.h"
 #include <windows.h>
 #include <mfapi.h>
@@ -132,7 +133,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
         // 優先尋找同步 (isAsync == 0) 編碼器
         for (UINT32 i = 0; i < count; i++) {
             WCHAR name[128] = { 0 };
-            ppActivate[i]->GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, name, 128, NULL);
+            ppActivate[i]->GetString(MFT_FRIENDLY_NAME_Attribute, name, 128, NULL);
             UINT32 isAsync = 0;
             ppActivate[i]->GetUINT32(MF_TRANSFORM_ASYNC, &isAsync);
 
@@ -149,8 +150,9 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
 
         hr = ppActivate[selectedIdx]->ActivateObject(IID_IMFTransform, (void**)&ctx->pTransform);
         WCHAR selName[128] = { 0 };
-        ppActivate[selectedIdx]->GetString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, selName, 128, NULL);
+        ppActivate[selectedIdx]->GetString(MFT_FRIENDLY_NAME_Attribute, selName, 128, NULL);
         if (SUCCEEDED(hr)) {
+            if(ndTraceEnabled()){char utf8[512]={};WideCharToMultiByte(CP_UTF8,0,selName,-1,utf8,sizeof(utf8),NULL,NULL);ND_StreamTraceName(utf8,(uintptr_t)ctx);UINT32 len=0;HRESULT hardwareHR=ppActivate[selectedIdx]->GetStringLength(MFT_ENUM_HARDWARE_URL_Attribute,&len);{NDTraceSpan trace("encoder.hardware_attribute",ctx);trace.value=SUCCEEDED(hardwareHR)?1:0;trace.result=hardwareHR;}}
             ctx->pActivation = ppActivate[selectedIdx];
             ctx->pActivation->AddRef();
             wprintf(L"  -> 【選定啟用】: %s\n", selName[0] ? selName : L"H264 MFT");
@@ -182,11 +184,12 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
         // 啟用低延遲 (即時串流無 B 幀)
         var.vt = VT_BOOL;
         var.boolVal = VARIANT_TRUE;
-        pCodecAPI->SetValue(&CODECAPI_AVLowLatencyMode, &var);
+        {NDTraceSpan trace("codec.CODECAPI_AVLowLatencyMode",ctx);trace.result=pCodecAPI->SetValue(&CODECAPI_AVLowLatencyMode, &var);}
 
         var.vt = VT_UI4;
         var.ulVal = eAVEncCommonRateControlMode_CBR;
-        if (FAILED(pCodecAPI->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var))) {
+        HRESULT rateHR;{NDTraceSpan trace("codec.CBR",ctx);rateHR=pCodecAPI->SetValue(&CODECAPI_AVEncCommonRateControlMode, &var);trace.result=rateHR;}
+ if (FAILED(rateHR)) {
             pCodecAPI->Release();
             H264_DestroyEncoder(ctx);
             return NULL;
@@ -195,9 +198,9 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
         // 設定目標平均碼率
         var.vt = VT_UI4;
         var.ulVal = ctx->bitrate;
-        pCodecAPI->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var);
+        {NDTraceSpan trace("codec.CODECAPI_AVEncCommonMeanBitRate",ctx);trace.result=pCodecAPI->SetValue(&CODECAPI_AVEncCommonMeanBitRate, &var);}
         var.ulVal = std::max(1, ctx->bitrate / 8 / 2);
-        pCodecAPI->SetValue(&CODECAPI_AVEncCommonBufferSize, &var);
+        {NDTraceSpan trace("codec.CODECAPI_AVEncCommonBufferSize",ctx);trace.result=pCodecAPI->SetValue(&CODECAPI_AVEncCommonBufferSize, &var);}
 
         // Leave QP unconstrained so busy desktops can trade image detail
         // for timely delivery instead of overriding the bitrate target.
@@ -205,7 +208,7 @@ void* H264_CreateEncoder(int width, int height, int fps, int bitrateKbps) {
         // 縮短關鍵幀週期 (GOP) 至 1 秒 (30 幀)，手一停下 1 秒內必定滿血恢復
         var.vt = VT_UI4;
         var.ulVal = ctx->fps;
-        pCodecAPI->SetValue(&CODECAPI_AVEncMPVGOPSize, &var);
+        {NDTraceSpan trace("codec.CODECAPI_AVEncMPVGOPSize",ctx);trace.result=pCodecAPI->SetValue(&CODECAPI_AVEncMPVGOPSize, &var);}
 
         pCodecAPI->Release();
     }
@@ -277,12 +280,13 @@ int H264_EncodeFrame(void* handle, const BYTE* bgraPixels, BYTE* outNalu, int ma
     if (isKeyframe) *isKeyframe = 0;
 
     // 1. BGRA 轉 NV12 (邊界安全，防止越界崩潰)
-    BGRA_To_NV12(bgraPixels, ctx->nv12Buffer.data(), ctx->srcWidth, ctx->srcHeight, ctx->alignedWidth, ctx->alignedHeight);
+    { NDTraceSpan trace("encode.convert",ctx,ctx->frameIndex);
+ BGRA_To_NV12(bgraPixels, ctx->nv12Buffer.data(), ctx->srcWidth, ctx->srcHeight, ctx->alignedWidth, ctx->alignedHeight); }
 
     // 2. 寫入輸入緩衝區
     BYTE* pDst = NULL;
     if (FAILED(ctx->pInMediaBuffer->Lock(&pDst, NULL, NULL)) || !pDst) return -6;
-    memcpy(pDst, ctx->nv12Buffer.data(), ctx->nv12Buffer.size());
+    {NDTraceSpan trace("encode.input_copy",ctx,ctx->frameIndex);memcpy(pDst, ctx->nv12Buffer.data(), ctx->nv12Buffer.size());}
     ctx->pInMediaBuffer->Unlock();
     ctx->pInMediaBuffer->SetCurrentLength((DWORD)ctx->nv12Buffer.size());
 
@@ -293,7 +297,7 @@ int H264_EncodeFrame(void* handle, const BYTE* bgraPixels, BYTE* outNalu, int ma
     ctx->frameIndex++;
 
     // 3. ProcessInput
-    HRESULT hr = ctx->pTransform->ProcessInput(0, ctx->pInSample, 0);
+    HRESULT hr;{NDTraceSpan trace("encode.process_input",ctx,ctx->frameIndex);hr=ctx->pTransform->ProcessInput(0, ctx->pInSample, 0);trace.result=hr;}
     if (FAILED(hr)) {
         if (ctx->frameIndex <= 3) {
             printf("  [除錯] ProcessInput 失敗: 0x%08X\n", (unsigned int)hr);
@@ -308,7 +312,7 @@ int H264_EncodeFrame(void* handle, const BYTE* bgraPixels, BYTE* outNalu, int ma
     outputBuffer.pSample = ctx->providesSamples ? NULL : ctx->pOutSample;
 
     DWORD dwStatus = 0;
-    hr = ctx->pTransform->ProcessOutput(0, 1, &outputBuffer, &dwStatus);
+    {NDTraceSpan trace("encode.process_output",ctx,ctx->frameIndex);hr = ctx->pTransform->ProcessOutput(0, 1, &outputBuffer, &dwStatus);trace.result=hr;}
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
         if (ctx->providesSamples && outputBuffer.pSample) outputBuffer.pSample->Release();
         if (outputBuffer.pEvents) outputBuffer.pEvents->Release();
@@ -354,7 +358,7 @@ int H264_EncodeFrame(void* handle, const BYTE* bgraPixels, BYTE* outNalu, int ma
     }
 
     int copyLen = (encLen < (DWORD)maxOutLen) ? encLen : maxOutLen;
-    memcpy(outNalu, pEncData, copyLen);
+    {NDTraceSpan trace("encode.output_copy",ctx,ctx->frameIndex);memcpy(outNalu, pEncData, copyLen);trace.value=copyLen;}
 
     if (isKeyframe && copyLen > 4) {
         for (int i = 0; i < copyLen - 4; i++) {
@@ -390,7 +394,7 @@ void H264_ForceKeyframe(void* handle) {
         VariantInit(&var);
         var.vt = VT_UI4;
         var.ulVal = 1;
-        pCodecAPI->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &var);
+        {NDTraceSpan trace("codec.CODECAPI_AVEncVideoForceKeyFrame",ctx);trace.result=pCodecAPI->SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &var);}
         pCodecAPI->Release();
     }
 }

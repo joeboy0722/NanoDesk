@@ -1,3 +1,4 @@
+#include "../../core/streamtrace/native.h"
 #include "decoder.h"
 #include <algorithm>
 #include <cstdint>
@@ -18,7 +19,19 @@ Decoder::~Decoder() {
     release(context);
     release(device);
 }
+void Decoder::submitted(unsigned long long frame) {
+ if(ndTraceEnabled()) {
+  auto now=std::chrono::steady_clock::now();
+  if(!traceNewPresented.time_since_epoch().count()||presentedFrame!=frame) {
+   if(traceNewPresented.time_since_epoch().count())ND_StreamTrace(const_cast<char*>("render.new_interval"),(uintptr_t)this,frame,std::chrono::duration_cast<std::chrono::microseconds>(now-traceNewPresented).count(),0,0);
+   traceNewPresented=now;
+   ND_StreamTrace(const_cast<char*>("render.new_submit"),(uintptr_t)this,frame,0,0,0);
+  } else ND_StreamTrace(const_cast<char*>("render.redraw"),(uintptr_t)this,frame,0,0,0);
+ }
+ presentedFrame=frame;
+}
 void Decoder::reset() {
+ traceTimes.clear();traceFrame=0;traceKey=false;tracePresented={};
     if (transform) {
         transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
         transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
@@ -84,6 +97,8 @@ bool Decoder::outputType() {
 }
 static BYTE clip(int v) { return BYTE(v < 0 ? 0 : v > 255 ? 255 : v); }
 int Decoder::feed(const unsigned char *data, int length) {
+    decodedIDR=false;
+ NDTraceSpan total("decode.feed",this,traceInputFrame);
     if (length <= 0 || length > 32 * 1024 * 1024)
         return -1;
     bool key = false;
@@ -116,7 +131,8 @@ int Decoder::feed(const unsigned char *data, int length) {
         buffer->Unlock();
         buffer->SetCurrentLength(length);
         sample->AddBuffer(buffer);
-        sample->SetSampleTime(tick);
+        {traceTimes[tick]={traceInputFrame,key};while(traceTimes.size()>128)traceTimes.erase(traceTimes.begin());}
+ sample->SetSampleTime(tick);
         tick += 333333;
         sample->SetSampleDuration(333333);
         hr = transform->ProcessInput(0, sample, 0);
@@ -186,7 +202,8 @@ int Decoder::feed(const unsigned char *data, int length) {
                 size_t need = size_t(stride) * height + size_t(stride) * ((height + 1) / 2);
                 if (size >= need) {
                     const BYTE *uv = src + size_t(stride) * height;
-                    for (unsigned y = 0; y < height; y++) {
+                    NDTraceSpan convert("decode.convert",this,traceFrame);
+ for (unsigned y = 0; y < height; y++) {
                         const BYTE *yr = src + size_t(y) * stride;
                         const BYTE *ur = uv + size_t(y / 2) * stride;
                         BYTE *dst = bgra.data() + size_t(y) * width * 4;
@@ -200,6 +217,8 @@ int Decoder::feed(const unsigned char *data, int length) {
                         }
                     }
                     result = 1;
+                    {LONGLONG pts=0;if(SUCCEEDED(out.pSample->GetSampleTime(&pts))){auto it=traceTimes.find(pts);if(it!=traceTimes.end()){traceFrame=it->second.first;traceKey=it->second.second;traceTimes.erase(traceTimes.begin(),std::next(it));}else{traceFrame=0;traceKey=false;}}else{traceFrame=0;traceKey=false;}decodedIDR=decodedIDR||traceKey;NDTraceSpan output("decode.output",this,traceFrame);output.value=traceKey?1:0;}
+
                 }
                 ob->Unlock();
             }
@@ -217,7 +236,10 @@ int Decoder::feed(const unsigned char *data, int length) {
     return result;
 }
 void Decoder::present() {
-    if (bgra.empty() || !hwnd)
+ auto snapshot=rendering?rendering:displayed;
+ const auto& buffer=snapshot?snapshot->pixels:bgra;
+ unsigned width=snapshot?snapshot->width:this->width,height=snapshot?snapshot->height:this->height;
+    if (buffer.empty() || !hwnd)
         return;
     unsigned dw = visibleWidth ? std::min(width, visibleWidth) : width,
              dh = visibleHeight ? std::min(height, visibleHeight) : height;
@@ -270,7 +292,7 @@ void Decoder::present() {
             release(swap);
     }
     if (swap && texture) {
-        context->UpdateSubresource(texture, 0, nullptr, bgra.data(), width * 4, 0);
+        context->UpdateSubresource(texture, 0, nullptr, buffer.data(), width * 4, 0);
         ID3D11Texture2D *back = nullptr;
         if (SUCCEEDED(swap->GetBuffer(0, IID_PPV_ARGS(&back)))) {
             D3D11_BOX box = {0, 0, 0, dw, dh, 1};
@@ -283,7 +305,9 @@ void Decoder::present() {
             release(device);
             return;
         }
-        if (FAILED(swap->Present(0, 0))) {
+        if(ndTraceEnabled()){auto now=std::chrono::steady_clock::now();if(tracePresented.time_since_epoch().count())ND_StreamTrace(const_cast<char*>("render.interval"),(uintptr_t)this,traceFrame,std::chrono::duration_cast<std::chrono::microseconds>(now-tracePresented).count(),0,0);tracePresented=now;}
+ HRESULT presentHR;{NDTraceSpan trace("render.present",this,traceFrame);if(ndTraceEnabled())++tracePresentCount;presentHR=swap->Present(0,0);trace.result=presentHR;trace.value=traceKey?1:0;if(SUCCEEDED(presentHR))submitted(snapshot?snapshot->frame:traceFrame);}
+ if (FAILED(presentHR)) {
             release(swap);
             release(texture);
             release(context);
@@ -292,8 +316,14 @@ void Decoder::present() {
     }
 }
 void Decoder::paint(HDC dc, int w, int h) {
-    if (bgra.empty())
+ auto previous=rendering;rendering=displayed;
+ struct Restore {Decoder* d;std::shared_ptr<const RenderSnapshot> previous;~Restore(){d->rendering=previous;}} restore{this,previous};
+ auto snapshot=rendering;const auto& buffer=snapshot?snapshot->pixels:bgra;
+ unsigned width=snapshot?snapshot->width:this->width,height=snapshot?snapshot->height:this->height;
+ NDTraceSpan paintTrace("render.paint",this,traceFrame);
+    if (buffer.empty())
         return;
+ if(ndTraceEnabled())++tracePaintCount;
     present();
     if (swap)
         return;
@@ -304,7 +334,8 @@ void Decoder::paint(HDC dc, int w, int h) {
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
-    StretchDIBits(dc, 0, 0, w, h, 0, 0, visibleWidth ? std::min(width, visibleWidth) : width,
-                  visibleHeight ? std::min(height, visibleHeight) : height, bgra.data(), &bi, DIB_RGB_COLORS,
+    int copied=StretchDIBits(dc, 0, 0, w, h, 0, 0, visibleWidth ? std::min(width, visibleWidth) : width,
+                  visibleHeight ? std::min(height, visibleHeight) : height, buffer.data(), &bi, DIB_RGB_COLORS,
                   SRCCOPY);
+    if(copied!=0&&copied!=GDI_ERROR)submitted(snapshot?snapshot->frame:traceFrame);
 }

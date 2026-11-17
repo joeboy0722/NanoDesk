@@ -12,6 +12,13 @@ typedef struct {
     char session[64];
     char text[8192];
 } NDEvent;
+unsigned long long ND_TraceFrame(const char*,unsigned long long);
+void ND_VideoOpen(const char*,unsigned long long);
+void ND_VideoClose(const char*,unsigned long long);
+int ND_VideoPublish(const char*,unsigned long long,void*);
+unsigned long long ND_TestShownFrame(const char*);
+unsigned long long ND_TestPendingVideo(const char*);
+unsigned long long ND_TestVideoPool(const char*);
 int ND_Init(void);
 int ND_Poll(NDEvent *);
 void ND_MainText(int which, const char *text);
@@ -38,9 +45,16 @@ void ND_Error(const char *text);
 int ND_Frame(const char *session, const unsigned char *data, int length);
 void ND_Panel(const char *session, const char *text, int members);
 void ND_Laser(const char *session, const char *id, const char *name, const char *color, double x, double y);
+int ND_TestShowWindow(void);
+unsigned long long ND_TestPaintCount(const char*);
+unsigned long long ND_TestPresentCount(const char*);
+void ND_TestDecoderTrace(void*, unsigned long long);
 void *ND_TestDecoderCreate(void);
 int ND_TestDecoderFeed(void *, const unsigned char *, int, int *, int *);
 void ND_TestDecoderClose(void *);
+void ND_DecoderReset(void *);
+void ND_SourceState(const char*,int);
+void ND_TestVideoWindow(const char*,int);
 #ifdef __cplusplus
 }
 #endif

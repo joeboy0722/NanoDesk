@@ -5,8 +5,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"kvm/core/streamtrace"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"kvm/core/auth"
@@ -29,8 +31,16 @@ var userColors = []string{
 }
 var clientSeq uint64
 
+type videoEncoder interface {
+	Encode([]byte) ([]byte, bool, error)
+	RequestKeyframe()
+	Close()
+}
+
 // Client 客戶端連線結構 (具備獨立存取權限、身分 Token 與多人協同狀態)
 type Client struct {
+	traceID             atomic.Uint64
+	traceQueued         map[uint32]time.Time
 	conn                Transport
 	mu                  sync.Mutex
 	id                  string
@@ -124,7 +134,10 @@ func (c *Client) writePump(h *StreamHub) {
 			}
 			c.mu.Lock()
 			c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			c.traceDequeue(data)
+			sent := streamtrace.Span("host.write", c.traceObject(), uint64(tracePacketID(data)))
 			err := c.conn.WriteMessage(MessageVideo, data)
+			sent(int64(len(data)), boolResult(err != nil))
 			c.mu.Unlock()
 			if err != nil {
 				return
@@ -153,6 +166,11 @@ func (c *Client) writePump(h *StreamHub) {
 
 // 串流中樞管理器 (支援多人協同、輸入租約鎖與雷射筆廣播)
 type StreamHub struct {
+	streamWake      chan struct{}
+	streamReset     bool
+	streamViewers   bool
+	traceGeneration uint64
+
 	done        chan struct{}
 	stopOnce    sync.Once
 	startOnce   sync.Once
@@ -168,7 +186,7 @@ type StreamHub struct {
 	capEngine            capture.Capturer
 	monitors             []capture.Monitor
 	currentMonitor       int
-	encoder              *encoder.H264Encoder
+	encoder              videoEncoder
 	requestKeyNext       bool
 	lastKeyRequest       time.Time
 	videoBitrateKbps     int
@@ -226,11 +244,14 @@ func newStreamHub() (*StreamHub, error) {
 
 // 為當前選中的螢幕初始化對應解析度的 H.264 編碼器
 func (h *StreamHub) initEncoderForCurrentMonitor() error {
+	finish := streamtrace.Span("encoder.rebuild", 0, 0)
+	defer finish(0, 0)
 
 	m := h.monitors[h.currentMonitor]
 	fps := 30
 	bitrateKbps := h.targetVideoBitrateLocked()
 
+	streamtrace.Emit(streamtrace.Event{Stage: "encoder.rebuild_requested", Generation: h.traceGeneration + 1, Value: int64(h.videoBitrateKbps), Result: int64(bitrateKbps)})
 	enc, err := encoder.NewH264Encoder(m.Width, m.Height, fps, bitrateKbps)
 	if err != nil {
 		return err
@@ -239,10 +260,18 @@ func (h *StreamHub) initEncoderForCurrentMonitor() error {
 	if h.encoder != nil {
 		h.encoder.Close()
 	}
+	h.traceGeneration++
 	h.encoder = enc
 	h.videoBitrateKbps = bitrateKbps
 	h.requestKeyNext = true
 	h.lastKeyRequest = time.Time{}
+	h.streamReset = true
+	if h.streamWake != nil {
+		select {
+		case h.streamWake <- struct{}{}:
+		default:
+		}
+	}
 	fmt.Printf("🎥 已為螢幕 %d (%dx%d) 啟用 H.264 即時編碼器\n", m.Index, m.Width, m.Height)
 	return nil
 }
@@ -251,6 +280,7 @@ func (h *StreamHub) initEncoderForCurrentMonitor() error {
 func (h *StreamHub) registerClient(c *Client) {
 	h.mu.Lock()
 	h.clients[c] = true
+	h.signalStreamLocked()
 	count := len(h.clients)
 	lastIP := c.ip
 	h.mu.Unlock()
@@ -286,6 +316,7 @@ func (h *StreamHub) sendInitInfo(c *Client) {
 	monitors := h.monitors
 	curMon := h.currentMonitor
 	h.requestKeyNext = true
+	h.signalStreamLocked()
 	h.mu.Unlock()
 
 	c.safeSendJSON(map[string]interface{}{
@@ -318,6 +349,7 @@ func (h *StreamHub) unregisterClient(c *Client) {
 		return // 防止重複清理
 	}
 	delete(h.clients, c)
+	h.signalStreamLocked()
 	count := len(h.clients)
 	wasController := h.currentController == c
 	if wasController {
@@ -349,6 +381,7 @@ func (h *StreamHub) kickAllClients() {
 	for c := range h.clients {
 		clients = append(clients, c)
 		delete(h.clients, c)
+		h.signalStreamLocked()
 	}
 	h.currentController = nil
 	h.controllerExpiry = time.Time{}
@@ -567,6 +600,7 @@ func (h *StreamHub) requestKeyframe() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.requestKeyNext = true
+	streamtrace.Emit(streamtrace.Event{Stage: "idr.host_request"})
 }
 
 // Queue overflow and multiple viewers can request IDRs together. Coalesce
@@ -574,11 +608,16 @@ func (h *StreamHub) requestKeyframe() {
 func (h *StreamHub) takeKeyframeRequest(now time.Time) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.requestKeyNext || (!h.lastKeyRequest.IsZero() && now.Sub(h.lastKeyRequest) < time.Second) {
+	if !h.requestKeyNext {
+		return false
+	}
+	if !h.lastKeyRequest.IsZero() && now.Sub(h.lastKeyRequest) < 500*time.Millisecond {
+		streamtrace.Emit(streamtrace.Event{Stage: "idr.host_throttled", DurationUS: now.Sub(h.lastKeyRequest).Microseconds()})
 		return false
 	}
 	h.requestKeyNext = false
 	h.lastKeyRequest = now
+	streamtrace.Emit(streamtrace.Event{Stage: "idr.host_accept"})
 	return true
 }
 
@@ -659,21 +698,60 @@ func (h *StreamHub) broadcastClipboardImage(pngBytes []byte) {
 
 // 背景高幀率串流迴圈 (以約 30 FPS 持續擷取、壓縮並推流)
 func (h *StreamHub) startStreamingLoop() {
-	ticker := time.NewTicker(33 * time.Millisecond) // 目標約 30 FPS
-	defer ticker.Stop()
+	wake := make(chan struct{}, 1)
+	h.mu.Lock()
+	h.streamWake = wake
+	h.streamReset = false
+	h.mu.Unlock()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 
 	var startTime = time.Now()
 	var nextFrameAt time.Time
+	var traceFrame uint64
+	var lastFrame time.Time
+	var budgetStarted time.Time
+	var sourceStateAt time.Time
+	var sourceReused bool
 
 	for {
 		select {
 		case <-h.done:
 			return
-		case <-ticker.C:
+		case <-timer.C:
+			timer.Reset(time.Second / 30)
+		case <-wake:
+			h.mu.Lock()
+			reset := h.streamReset
+			h.streamReset = false
+			h.mu.Unlock()
+			if reset {
+				nextFrameAt = time.Time{}
+				lastFrame = time.Time{}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(time.Second / 30)
 		}
-		if time.Now().Before(nextFrameAt) {
+		if delay := time.Until(nextFrameAt); delay > 0 {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(delay)
 			continue
 		}
+		if !budgetStarted.IsZero() {
+			streamtrace.Emit(streamtrace.Event{Stage: "schedule.budget_actual", Frame: traceFrame, DurationUS: time.Since(budgetStarted).Microseconds()})
+			budgetStarted = time.Time{}
+		}
+		traceFrame++
 		h.streamMu.Lock()
 		// 只有在至少有一個客戶端連線時才抓取並壓縮，完全零無效負載！
 		h.mu.Lock()
@@ -683,24 +761,39 @@ func (h *StreamHub) startStreamingLoop() {
 				clientCount++
 			}
 		}
+		h.streamViewers = clientCount > 0
 		curMon := h.currentMonitor
 		if clientCount > 0 && h.encoder != nil && h.videoBitrateKbps != h.targetVideoBitrateLocked() {
+			nextFrameAt = time.Time{}
 			if err := h.initEncoderForCurrentMonitor(); err != nil {
 				fmt.Printf("H.264 bandwidth reconfiguration failed: %v\n", err)
+			}
+			h.streamReset = false
+			select {
+			case <-wake:
+			default:
 			}
 		}
 		enc := h.encoder
 		bitrateKbps := h.videoBitrateKbps
+		traceGeneration := h.traceGeneration
 		h.mu.Unlock()
 
 		if clientCount == 0 || enc == nil {
+			nextFrameAt = time.Time{}
+			lastFrame = time.Time{}
 			h.streamMu.Unlock()
 			continue
 		}
 
+		cycleStarted := time.Now()
 		// 1. 擷取畫面
+		captureDone := streamtrace.Span("capture.total", 0, traceFrame)
 		frame, err := h.capEngine.CaptureFrame(curMon)
+		captureDone(0, boolResult(err != nil))
 		if err != nil || frame == nil {
+			nextFrameAt = time.Time{}
+			lastFrame = time.Time{}
 			h.streamMu.Unlock()
 			if err != nil {
 				h.recoverCapture()
@@ -708,12 +801,19 @@ func (h *StreamHub) startStreamingLoop() {
 			continue
 		}
 
+		if frame.Reused != sourceReused || time.Since(sourceStateAt) >= time.Second {
+			sourceReused = frame.Reused
+			sourceStateAt = time.Now()
+			h.broadcastSourceState(frame.Reused, frame.LastFreshMicro)
+		}
 		// 2. H.264 即時編碼
-		encodeStarted := time.Now()
+
 		if h.takeKeyframeRequest(time.Now()) {
 			enc.RequestKeyframe()
 		}
+		encodeDone := streamtrace.Span("encode.total", 0, traceFrame)
 		nalu, isKey, err := enc.Encode(frame.Data)
+		encodeDone(int64(len(nalu)), boolResult(err != nil))
 		h.streamMu.Unlock()
 		if err != nil || len(nalu) == 0 {
 			if err != nil {
@@ -724,13 +824,28 @@ func (h *StreamHub) startStreamingLoop() {
 		// The encoder's bitrate is a target, not an absolute bound for arbitrary
 		// pixels. Slow capture BEFORE encoding the next frame when output is
 		// expensive; dropping encoded reference frames would break the GOP.
-		nextFrameAt = encodeStarted.Add(videoFrameDelay(len(nalu), bitrateKbps))
+		delay := max(time.Second/30, videoFrameDelay(len(nalu), bitrateKbps))
+		nextFrameAt = productionDeadline(cycleStarted, len(nalu), bitrateKbps)
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(max(time.Duration(0), time.Until(nextFrameAt)))
+		budgetStarted = time.Now()
+		streamtrace.Emit(streamtrace.Event{Stage: "schedule.budget_planned", Frame: traceFrame, DurationUS: delay.Microseconds(), Value: int64(len(nalu)), Result: int64(bitrateKbps)})
+		if !lastFrame.IsZero() {
+			streamtrace.Emit(streamtrace.Event{Stage: "produce.interval", Frame: traceFrame, DurationUS: time.Since(lastFrame).Microseconds()})
+		}
+		lastFrame = time.Now()
 
 		// 3. 封裝 Web KVM 二進位協議：
 		// [0]: isKey (1 或 0)
 		// [1..4]: 32-bit BigEndian 時間戳記 (毫秒)
 		// [5..]: H.264 Annex-B NAL 數據
 		timestampMs := uint32(time.Since(startTime).Milliseconds())
+		streamtrace.Emit(streamtrace.Event{Stage: "produce.frame", Frame: traceFrame, Generation: traceGeneration, Value: int64(timestampMs), Result: boolResult(isKey)})
 		packet := make([]byte, 5+len(nalu))
 		if isKey {
 			packet[0] = 1

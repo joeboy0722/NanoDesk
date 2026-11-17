@@ -1,3 +1,4 @@
+#include "../../core/streamtrace/native.h"
 #include "decoder.h"
 #include "native.h"
 #include <algorithm>
@@ -8,12 +9,15 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <atomic>
 #include <shellscalingapi.h>
 #include <string>
 #include <vector>
 #include <windows.h>
 #include <windowsx.h>
 
+static void adoptSnapshots();
 static HHOOK keyboardHook = nullptr;
 static HINSTANCE instance;
 static double uiScale = 1;
@@ -72,6 +76,7 @@ struct Remote {
     LONG_PTR style = 0;
     std::wstring info = L"尚未連線", members = L"";
     ULONGLONG lastFrame = 0, lastKeyRequest = 0, noticeUntil = 0;
+    bool sourceReused = false;
     bool authenticated = false, ended = false;
 };
 struct Pointer {
@@ -948,7 +953,7 @@ static LRESULT CALLBACK canvasProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         GetClientRect(h, &rc);
         // The decoder covers the entire canvas. Clearing it with GDI before
         // every Direct3D Present exposes a blank background between frames.
-        if (r->decoder && !r->decoder->bgra.empty())
+        if (r->decoder && !r->decoder->pixels().empty())
             r->decoder->paint(dc, rc.right, rc.bottom);
         else
             fill(dc, rc, highContrast ? GetSysColor(COLOR_WINDOW) : canvasBackground);
@@ -1162,12 +1167,9 @@ static LRESULT CALLBACK remoteProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     case WM_TIMER:
         if (IsWindowVisible(h) && r->authenticated && !r->ended && GetTickCount64() - r->lastFrame > 4000) {
-            SetWindowTextW(r->status, L"畫面停滯，正在要求關鍵幀…");
+            SetWindowTextW(r->status, r->sourceReused ? L"來源畫面暫未更新" : L"畫面停滯，正在等待恢復…");
             r->noticeUntil = GetTickCount64();
-            if (GetTickCount64() - r->lastKeyRequest > 2000) {
-                command(r, "{\"type\":\"request_keyframe\"}");
-                r->lastKeyRequest = GetTickCount64();
-            }
+
         }
         return 0;
     case WM_COMMAND: {
@@ -1785,6 +1787,7 @@ extern "C" int ND_IsActive(const char *sid) {
 }
 
 static LRESULT CALLBACK mainProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+ if(msg==WM_APP+90){adoptSnapshots();return 0;}
     if (LRESULT themed = themeMessage(h, msg, w, l))
         return themed;
     switch (msg) {
@@ -1968,7 +1971,15 @@ extern "C" int ND_Init() {
 extern "C" int ND_Poll(NDEvent *out) {
     MSG msg;
     int count = 0;
-    while (count++ < 64 && PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+    while (count++ < 64) {
+        BOOL available;
+        { NDTraceSpan trace("ui.peek", mainWindow);
+          available = PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE);
+          trace.value = available; }
+        if (!available) break;
+        NDTraceSpan messageTrace("ui.message", msg.hwnd);
+        messageTrace.value = msg.message; // Message number only; never WPARAM/LPARAM contents.
+
         if (msg.message == WM_QUIT) {
             running = false;
             break;
@@ -2115,6 +2126,7 @@ extern "C" void ND_Open(const char *sid, const char *id) {
     rebuildTabs();
     showPage();
     SetFocus(tabs);
+ adoptSnapshots();
 }
 extern "C" void ND_RemoteText(const char *sid, const char *s) {
     Remote *r = find(sid);
@@ -2167,6 +2179,7 @@ extern "C" void ND_Authenticated(const char *sid, int role) {
     if (IsWindowVisible(r->hwnd) && GetForegroundWindow() == hostOf(r))
         SetFocus(r->canvas);
     syncInput();
+ adoptSnapshots();
 }
 extern "C" void ND_ClearMonitors(const char *sid) {
     Remote *r = find(sid);
@@ -2335,4 +2348,93 @@ extern "C" void ND_Forget(const char *sid) {
     pointers.erase(sid);
     chats.erase(sid);
     remotes.erase(sid);
+}
+
+extern "C" unsigned long long ND_TraceFrame(const char* sid, unsigned long long frame) {
+    Remote* r = find(sid);
+    if (!r || !r->decoder) return 0;
+    r->decoder->traceInputFrame = frame;
+    return reinterpret_cast<uintptr_t>(r->decoder.get());
+}
+
+extern "C" int ND_TestShowWindow() {
+    if (!mainWindow) return 0;
+    // ND_Init's first ShowWindow can inherit SW_HIDE from a background launcher.
+    ShowWindow(mainWindow, SW_SHOWNORMAL);
+    UpdateWindow(mainWindow);
+    return IsWindowVisible(mainWindow) ? 1 : 0;
+}
+extern "C" unsigned long long ND_TestPaintCount(const char* sid) {
+    Remote* r = find(sid);
+    return r && r->decoder ? r->decoder->tracePaintCount : 0;
+}
+extern "C" unsigned long long ND_TestPresentCount(const char* sid) {
+    Remote* r = find(sid);
+    return r && r->decoder ? r->decoder->tracePresentCount : 0;
+}
+
+struct VideoSlot {
+ std::string sid;unsigned long long generation;
+ std::atomic<bool> closed{false},pending{false};
+ std::mutex mutex;
+ std::shared_ptr<const RenderSnapshot> latest;
+ std::vector<std::shared_ptr<RenderSnapshot>> pool;
+};
+static std::mutex videoSlotsMutex;
+static std::map<std::string,std::shared_ptr<VideoSlot>> videoSlots;
+extern "C" void ND_VideoOpen(const char* sid,unsigned long long generation) {
+ auto slot=std::make_shared<VideoSlot>();slot->sid=sid;slot->generation=generation;
+ std::lock_guard<std::mutex> lock(videoSlotsMutex);
+ auto old=videoSlots.find(sid);if(old!=videoSlots.end())old->second->closed=true;
+ videoSlots[sid]=slot;
+}
+extern "C" void ND_VideoClose(const char* sid,unsigned long long generation) {
+ std::lock_guard<std::mutex> lock(videoSlotsMutex);auto it=videoSlots.find(sid);
+ if(it!=videoSlots.end()&&it->second->generation==generation){it->second->closed=true;videoSlots.erase(it);}
+}
+extern "C" int ND_VideoPublish(const char* sid,unsigned long long generation,void* decoder) {
+ std::shared_ptr<VideoSlot> slot;
+ {std::lock_guard<std::mutex> lock(videoSlotsMutex);auto it=videoSlots.find(sid);if(it==videoSlots.end()||it->second->generation!=generation)return 0;slot=it->second;}
+ Decoder* d=static_cast<Decoder*>(decoder);if(!d||d->bgra.empty()||slot->closed)return 0;
+ std::lock_guard<std::mutex> lock(slot->mutex);
+ std::shared_ptr<RenderSnapshot> target;
+ for(auto& candidate:slot->pool)if(candidate.use_count()==1){target=candidate;break;}
+ if(!target&&slot->pool.size()<3){target=std::make_shared<RenderSnapshot>();slot->pool.push_back(target);}
+ if(!target)return d->decodedIDR?2:1; // Decoding succeeded even if display snapshots are leased.
+ target->pixels=d->bgra;target->width=d->width;target->height=d->height;target->frame=d->traceFrame;target->key=d->traceKey;
+ if(slot->closed)return 0;
+ std::atomic_store(&slot->latest,std::shared_ptr<const RenderSnapshot>(target));
+ if(mainWindow&&!slot->pending.exchange(true))PostMessageW(mainWindow,WM_APP+90,0,0);
+ return d->decodedIDR?2:1;
+}
+static void adoptSnapshots() {
+ std::vector<std::shared_ptr<VideoSlot>> slots;
+ {std::lock_guard<std::mutex> lock(videoSlotsMutex);for(auto& item:videoSlots)slots.push_back(item.second);}
+ for(auto& slot:slots){
+  slot->pending=false;if(slot->closed)continue;auto snapshot=std::atomic_load(&slot->latest);
+  Remote* r=find(slot->sid.c_str());if(!snapshot||!r||!r->decoder||r->ended||!r->authenticated)continue;
+  Decoder* d=r->decoder.get();if(d->displayed==snapshot)continue;
+  bool resized=d->width!=snapshot->width||d->height!=snapshot->height;
+  d->displayed=snapshot;d->width=snapshot->width;d->height=snapshot->height;d->traceFrame=snapshot->frame;d->traceKey=snapshot->key;
+  r->lastFrame=GetTickCount64();
+  if(!r->sourceReused&&r->noticeUntil&&r->lastFrame>r->noticeUntil){r->noticeUntil=0;SetWindowTextW(r->status,L"已連線");}
+  if(resized)layout(r);InvalidateRect(r->canvas,nullptr,FALSE);
+ }
+}
+
+extern "C" unsigned long long ND_TestShownFrame(const char* sid){auto r=find(sid);return r&&r->decoder?r->decoder->presentedFrame:0;}
+extern "C" unsigned long long ND_TestPendingVideo(const char* sid){std::lock_guard<std::mutex> lock(videoSlotsMutex);auto it=videoSlots.find(sid);return it!=videoSlots.end()&&it->second->pending?1:0;}
+extern "C" unsigned long long ND_TestVideoPool(const char* sid){std::shared_ptr<VideoSlot> slot;{std::lock_guard<std::mutex> lock(videoSlotsMutex);auto it=videoSlots.find(sid);if(it==videoSlots.end())return 0;slot=it->second;}std::lock_guard<std::mutex> lock(slot->mutex);return slot->pool.size();}
+
+extern "C" void ND_SourceState(const char* sid,int reused){
+ auto r=find(sid);if(!r||r->ended)return;
+ bool changed=r->sourceReused!=(reused!=0);r->sourceReused=reused!=0;
+ if(r->sourceReused)SetWindowTextW(r->status,L"來源畫面暫未更新");
+ else if(changed)SetWindowTextW(r->status,L"已連線");
+}
+extern "C" void ND_TestVideoWindow(const char* sid,int mode){
+ auto r=find(sid);if(!r||!r->hwnd)return;
+ if(mode==1)ShowWindow(r->hwnd,SW_MINIMIZE);
+ else if(mode==2)ShowWindow(r->hwnd,SW_RESTORE);
+ else SetWindowPos(r->hwnd,nullptr,0,0,960,640,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
 }

@@ -46,7 +46,11 @@ func NewWithDevices(mgr *auth.AuthManager, ui HostUI, d Devices) (*StreamHub, er
 	if len(monitors) == 0 {
 		return nil, fmt.Errorf("no desktop monitors")
 	}
-	return &StreamHub{done: make(chan struct{}), authMgr: mgr, hostGUI: ui, clients: map[*Client]bool{}, capEngine: d.Capture, encoder: d.Encoder, inputCtrl: d.Input, monitors: monitors, currentMonitor: primaryMonitor(monitors), requestKeyNext: true}, nil
+	h := &StreamHub{done: make(chan struct{}), authMgr: mgr, hostGUI: ui, clients: map[*Client]bool{}, capEngine: d.Capture, inputCtrl: d.Input, monitors: monitors, currentMonitor: primaryMonitor(monitors), requestKeyNext: true}
+	if d.Encoder != nil {
+		h.encoder = d.Encoder
+	}
+	return h, nil
 }
 
 func NewHost(mgr *auth.AuthManager, ui HostUI) (*StreamHub, error) {

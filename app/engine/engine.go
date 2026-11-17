@@ -3,8 +3,10 @@ package engine
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"kvm/core/streamtrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -14,6 +16,8 @@ import (
 	"github.com/gorilla/websocket"
 	pionice "github.com/pion/ice/v4"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"kvm/core/auth"
@@ -24,34 +28,46 @@ import (
 )
 
 type Event struct {
+	VideoSession        uint64
+	VideoEpoch          uint64
+	TraceAt             time.Time
+	TraceFrame          uint64
+	TraceObject         uint64
 	Kind, Session, Text string
 	Data                []byte
 	Run                 func()
 }
 type Engine struct {
-	mu                 sync.Mutex
-	state              *identity.State
-	conn               *websocket.Conn
-	write              sync.Mutex
-	peers              map[string]*Peer
-	mgr                *auth.AuthManager
-	host               atomic.Pointer[desktop.StreamHub]
-	Events             chan Event
-	ctx                context.Context
-	cancel             context.CancelFunc
-	generation         uint64
-	services           Services
-	videoMu            sync.Mutex
-	waitingKey         map[string]bool
-	keyRequested       map[string]time.Time
-	Frames             chan Event
-	clipboardPublisher ClipboardPublisher
+	mu                  sync.Mutex
+	state               *identity.State
+	conn                *websocket.Conn
+	write               sync.Mutex
+	peers               map[string]*Peer
+	mgr                 *auth.AuthManager
+	host                atomic.Pointer[desktop.StreamHub]
+	Events              chan Event
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	generation          uint64
+	services            Services
+	recovery            map[string]*videoRecovery
+	videoMu             sync.Mutex
+	traceSessionObjects map[string]uint64
+	traceKeyStarted     map[string]time.Time
+	waitingKey          map[string]bool
+	keyRequested        map[string]time.Time
+	Frames              chan Event
+	clipboardPublisher  ClipboardPublisher
 }
 type Services struct {
+	VideoSink        VideoSink
 	HostFactory      func(*auth.AuthManager, desktop.HostUI) (*desktop.StreamHub, error)
 	ReceiveDirectory func() (string, error)
 }
 type Peer struct {
+	videoGeneration     uint64
+	traceRelayTLS       atomic.Bool
+	traceID             atomic.Uint64
 	diagnosticPackets   atomic.Uint64
 	diagnosticBytes     atomic.Uint64
 	diagnosticSamples   atomic.Uint64
@@ -71,7 +87,10 @@ type Peer struct {
 	caller              bool
 	pc                  *webrtc.PeerConnection
 	control, file       *webrtc.DataChannel
-	track               *webrtc.TrackLocalStaticSample
+	track               *webrtc.TrackLocalStaticRTP
+	packetizer          rtp.Packetizer
+	videoClock          sourceVideoClock
+	videoWrite          sync.Mutex
 	client              *desktop.Client
 	closed              bool
 	once                sync.Once
@@ -98,6 +117,9 @@ func NewWithServices(s *identity.State, services Services) (*Engine, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{state: s, peers: map[string]*Peer{}, Events: make(chan Event, 256), ctx: ctx, cancel: cancel, services: services, Frames: make(chan Event, 3), waitingKey: map[string]bool{}, keyRequested: map[string]time.Time{}}
 	e.mgr = auth.NewAuthManager(nil)
+	if services.VideoSink != nil {
+		services.VideoSink.SetFeedback(e.VideoFeedback)
+	}
 	if err := e.apply(s.Settings); err != nil {
 		cancel()
 		return nil, err
@@ -428,6 +450,9 @@ func (e *Engine) DisconnectAll() {
 	}
 }
 func (e *Engine) Close() {
+	if e.services.VideoSink != nil {
+		defer e.services.VideoSink.Close()
+	}
 	defer func() {
 		if h := e.host.Load(); h != nil {
 			h.Close()
@@ -460,7 +485,12 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 		return fmt.Errorf("invalid peer identity")
 	}
 	e.mu.Lock()
-	if len(e.peers) >= 16 {
+	old := e.peers[m.Session]
+	if old != nil {
+		e.mu.Unlock()
+		return fmt.Errorf("duplicate peer session")
+	}
+	if len(e.peers) >= 16 && old == nil {
 		e.mu.Unlock()
 		return fmt.Errorf("連線數已滿")
 	}
@@ -518,7 +548,18 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 		return err
 	}
 	p := &Peer{relaySocket: relaySocket, relayMux: relayMux, engine: e, sid: m.Session, id: m.Target, ip: m.IP, caller: m.Caller, pc: pc, fileAck: make(chan fileMeta, 8)}
+	if m.Caller && e.services.VideoSink != nil {
+		p.videoGeneration = e.services.VideoSink.OpenSession(p.sid)
+		e.videoMu.Lock()
+		e.recoveryLocked(p.sid)
+		e.recovery[p.sid] = &videoRecovery{object: p.traceObject(), session: p.videoGeneration, epoch: 1, stage: 1}
+		e.videoMu.Unlock()
+	}
+	if streamtrace.Enabled() {
+		go p.traceStats()
+	}
 	if m.RelayPath != nil {
+		p.traceRelayTLS.Store(settings.RelayTLSOnly || m.RelayPath.TLS)
 		p.relayGeneration = m.RelayPath.Credentials.Generation
 		p.relayBudgetMbps.Store(m.RelayPath.BandwidthMbps)
 	}
@@ -584,21 +625,67 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 				p.Close()
 				return
 			}
-			builder := newVideoSampleBuilder()
-			for {
-				packet, _, er := t.ReadRTP()
-				if er != nil {
-					return
+			assembler := newVideoAssembler()
+			assembler.object = p.traceObject()
+			observer := newRTPTrace(p.traceObject())
+			packets := make(chan *rtp.Packet, 64)
+			readDone := make(chan struct{})
+			cancelRead := make(chan struct{})
+			defer close(cancelRead)
+			go func() {
+				defer close(readDone)
+				for {
+					packet, _, err := t.ReadRTP()
+					if err != nil {
+						return
+					}
+					select {
+					case packets <- packet:
+					case <-cancelRead:
+						return
+					}
 				}
-				p.diagnosticPackets.Add(1)
-				p.diagnosticBytes.Add(uint64(len(packet.Payload)))
-				builder.Push(packet)
-				for sample := builder.Pop(); sample != nil; sample = builder.Pop() {
+			}()
+			timer := time.NewTicker(10 * time.Millisecond)
+			defer timer.Stop()
+			emit := func(samples []*media.Sample) {
+				for _, sample := range samples {
+					streamtrace.Emit(streamtrace.Event{Stage: "rtp.sample", Object: p.traceObject(), Frame: uint64(sample.PacketTimestamp), Value: int64(len(sample.Data)), Result: int64(sample.PrevDroppedPackets)})
 					p.diagnosticSamples.Add(1)
 					if annexKeyframe(sample.Data) {
 						p.diagnosticKeys.Add(1)
 					}
 					e.emitVideoSample(p, sample)
+				}
+				if assembler.loss {
+					e.videoLostPeer(p)
+					assembler.loss = false
+				}
+			}
+			for {
+				select {
+				case packet := <-packets:
+					p.diagnosticPackets.Add(1)
+					p.diagnosticBytes.Add(uint64(len(packet.Payload)))
+					observer.packet(packet)
+					emit(assembler.push(packet, time.Now()))
+				case now := <-timer.C:
+					emit(assembler.drain(now))
+					e.retryVideo(p, now)
+				case <-readDone:
+					for {
+						select {
+						case packet := <-packets:
+							p.diagnosticPackets.Add(1)
+							p.diagnosticBytes.Add(uint64(len(packet.Payload)))
+							observer.packet(packet)
+							emit(assembler.push(packet, time.Now()))
+						default:
+							return
+						}
+					}
+				case <-e.ctx.Done():
+					return
 				}
 			}
 		})
@@ -610,7 +697,7 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 			}
 		}()
 	} else {
-		track, er := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"}, "desktop", "NanoDesk")
+		track, er := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264, ClockRate: 90000, SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"}, "desktop", "NanoDesk")
 		if er != nil {
 			p.Close()
 			return er
@@ -620,6 +707,11 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 		if er != nil {
 			p.Close()
 			return er
+		}
+		if streamtrace.Enabled() {
+			for _, encoding := range sender.GetParameters().Encodings {
+				streamtrace.Emit(streamtrace.Event{Stage: "transport.ssrc", Object: p.traceObject(), Value: int64(encoding.SSRC)})
+			}
 		}
 		go func() {
 			for {
@@ -633,6 +725,7 @@ func (e *Engine) newPeer(m protocol.Signal) error {
 						for _, report := range feedback.Reports {
 							for _, encoding := range sender.GetParameters().Encodings {
 								if report.SSRC == uint32(encoding.SSRC) {
+									streamtrace.Emit(streamtrace.Event{Stage: "rtcp.report", Object: p.traceObject(), Value: int64(report.FractionLost), Result: int64(report.TotalLost)})
 									p.videoRate.observe(time.Now(), p.configuredVideoBitrateKbps(), report.FractionLost)
 								}
 							}
@@ -942,7 +1035,32 @@ func (p *Peer) WriteMessage(kind int, b []byte) error {
 		if len(b) < 6 {
 			return nil
 		}
-		return p.track.WriteSample(media.Sample{Data: b[5:], Duration: time.Second / 30})
+		streamtrace.Emit(streamtrace.Event{Stage: "transport.source_frame", Object: p.traceObject(), Frame: uint64(binary.BigEndian.Uint32(b[1:5])), Value: int64(len(b) - 5), Result: int64(b[0])})
+		done := streamtrace.Span("transport.write_sample", p.traceObject(), uint64(binary.BigEndian.Uint32(b[1:5])))
+		p.videoWrite.Lock()
+		if p.packetizer == nil {
+			p.packetizer = rtp.NewPacketizer(1200, 0, 0, &codecs.H264Payloader{}, rtp.NewRandomSequencer(), 90000)
+		}
+		packets := p.packetizer.Packetize(b[5:], 0)
+		if !p.videoClock.initialized && len(packets) > 0 {
+			p.videoClock.origin = packets[0].Timestamp
+		}
+		stamp := p.videoClock.timestamp(binary.BigEndian.Uint32(b[1:5]))
+		var err error
+		for _, packet := range packets {
+			packet.Timestamp = stamp
+			if writeErr := p.track.WriteRTP(packet); writeErr != nil {
+				err = writeErr
+				break
+			}
+		}
+		p.videoWrite.Unlock()
+		result := int64(0)
+		if err != nil {
+			result = 1
+		}
+		done(int64(len(b)-5), result)
+		return err
 	}
 	if kind == desktop.MessageClose {
 		go p.Close()
@@ -973,6 +1091,9 @@ func (p *Peer) Close() error {
 	if !first {
 		return nil
 	}
+	if p.engine.services.VideoSink != nil && p.videoGeneration != 0 {
+		p.engine.services.VideoSink.CloseSession(p.sid, p.videoGeneration)
+	}
 	go func() {
 		p.mu.Lock()
 		p.closed = true
@@ -983,7 +1104,9 @@ func (p *Peer) Close() error {
 			recv.close()
 		}
 		p.engine.signal(protocol.Signal{Type: "close", Session: p.sid})
-		p.pc.Close()
+		if p.pc != nil {
+			p.pc.Close()
+		}
 		if p.relayMux != nil {
 			p.relayMux.Close()
 		}
@@ -991,13 +1114,24 @@ func (p *Peer) Close() error {
 			p.engine.host.Load().Detach(c)
 		}
 		p.engine.mu.Lock()
-		delete(p.engine.peers, p.sid)
-		p.engine.mu.Unlock()
+		current := p.engine.peers[p.sid] == p
+		if current {
+			delete(p.engine.peers, p.sid)
+		}
 		p.engine.videoMu.Lock()
-		delete(p.engine.waitingKey, p.sid)
-		delete(p.engine.keyRequested, p.sid)
+		r := p.engine.recovery[p.sid]
+		if current && (r == nil || r.session == p.videoGeneration) {
+			delete(p.engine.recovery, p.sid)
+			delete(p.engine.waitingKey, p.sid)
+			delete(p.engine.keyRequested, p.sid)
+			delete(p.engine.traceKeyStarted, p.sid)
+			delete(p.engine.traceSessionObjects, p.sid)
+		}
 		p.engine.videoMu.Unlock()
-		p.engine.emit(Event{Kind: "closed", Session: p.sid, Text: "連線已結束"})
+		p.engine.mu.Unlock()
+		if current {
+			p.engine.emit(Event{Kind: "closed", Session: p.sid, Text: "連線已結束", VideoSession: p.videoGeneration})
+		}
 	}()
 	return nil
 }
@@ -1006,4 +1140,13 @@ func (e *Engine) DisplayChanged() {
 	if h := e.host.Load(); h != nil {
 		go h.RecoverDisplay()
 	}
+}
+
+func (e *Engine) VideoSession(sid string) uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if p := e.peers[sid]; p != nil {
+		return p.videoGeneration
+	}
+	return 0
 }

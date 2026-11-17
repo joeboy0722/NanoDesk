@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"kvm/core/streamtrace"
 	"net"
 	"os"
 	"sync"
@@ -11,12 +12,15 @@ type receivedDatagram struct {
 	data       []byte
 	source     net.Addr
 	generation uint64
+	traceAt    time.Time
+	traceFrame uint64
 }
 
 // SwitchConn keeps ICE's packet socket alive across authenticated relay paths.
 // During recovery, writes are discarded so WebRTC's transport retransmits
 // reliable data without retaining obsolete video in an unbounded buffer.
 type SwitchConn struct {
+	traceID                     uint64
 	mu                          sync.Mutex
 	active                      *ClientConn
 	generation                  uint64
@@ -31,6 +35,9 @@ type SwitchConn struct {
 
 func NewSwitchConn(conn *ClientConn, local net.Addr, onFailure func()) *SwitchConn {
 	c := &SwitchConn{local: local, changed: make(chan struct{}), packets: make(chan receivedDatagram, 128), done: make(chan struct{}), onFailure: onFailure}
+	if streamtrace.Enabled() {
+		c.traceID = streamtrace.ID()
+	}
 	c.replace(conn)
 	return c
 }
@@ -64,17 +71,30 @@ func (c *SwitchConn) receive(conn *ClientConn, generation uint64) {
 	go func() {
 		defer close(readDone)
 		buffer := make([]byte, MaxPayload)
+		var traceFrame uint64
 		for {
+			readDone := streamtrace.Span("relay.client_read", c.traceID, 0)
 			n, source, err := conn.ReadFrom(buffer)
+			result := int64(0)
+			if err != nil {
+				result = 1
+			}
+			readDone(int64(n), result)
 			if err != nil {
 				return
 			}
 			p := receivedDatagram{data: append([]byte(nil), buffer[:n]...), source: source, generation: generation}
+			if streamtrace.Enabled() {
+				traceFrame++
+				p.traceFrame = traceFrame
+				p.traceAt = time.Now()
+			}
 			select {
 			case <-c.done:
 				return
 			case c.packets <- p:
 			default:
+				streamtrace.Emit(streamtrace.Event{Stage: "relay.switch_queue_drop", Object: c.traceID, Frame: p.traceFrame, Generation: generation, Value: int64(len(c.packets)), Result: int64(n)})
 			}
 		}
 	}()
@@ -131,6 +151,9 @@ func (c *SwitchConn) ReadFrom(data []byte) (int, net.Addr, error) {
 			current := p.generation == c.generation
 			c.mu.Unlock()
 			if current {
+				if !p.traceAt.IsZero() {
+					streamtrace.Emit(streamtrace.Event{Stage: "relay.switch_queue_age", Object: c.traceID, Frame: p.traceFrame, Generation: p.generation, DurationUS: time.Since(p.traceAt).Microseconds(), Value: int64(len(c.packets))})
+				}
 				return copy(data, p.data), p.source, nil
 			}
 		}

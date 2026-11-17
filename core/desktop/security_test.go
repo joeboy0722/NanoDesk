@@ -250,3 +250,26 @@ func TestSharedNativeClipboardLatestCopyWins(t *testing.T) {
 		t.Fatal("replaced file offer still readable")
 	}
 }
+
+func TestFullHostQueueRetainsIncomingRecoveryIDR(t *testing.T) {
+	c := &Client{sendChan: make(chan []byte, 3), done: make(chan struct{}), needsKey: true}
+	for _, data := range [][]byte{{1, 1}, {0, 2}, {0, 3}} {
+		if c.enqueueFrame(data) {
+			t.Fatal("unexpected overflow")
+		}
+	}
+	fresh := []byte{1, 9}
+	if c.enqueueFrame(fresh) {
+		t.Fatal("requested a replacement for an available recovery IDR")
+	}
+	if c.needsKey || len(c.sendChan) != 1 {
+		t.Fatal("did not replace only the dependent GOP")
+	}
+	retained := <-c.sendChan
+	if len(retained) != len(fresh) || retained[1] != 9 {
+		t.Fatal("kept stale GOP instead of incoming IDR")
+	}
+	if c.enqueueFrame([]byte{0, 10}) || len(c.sendChan) != 1 {
+		t.Fatal("fresh IDR did not restore ordered delta delivery")
+	}
+}

@@ -15,13 +15,13 @@ func TestKeyframeRequestsCoalesceDuringCongestion(t *testing.T) {
 	if !h.takeKeyframeRequest(now) {
 		t.Fatal("first recovery request delayed")
 	}
-	for i := 1; i < 100; i++ {
+	for i := 1; i < 50; i++ {
 		h.requestKeyframe()
 		if h.takeKeyframeRequest(now.Add(time.Duration(i) * 10 * time.Millisecond)) {
 			t.Fatal("congestion produced an IDR storm")
 		}
 	}
-	if !h.takeKeyframeRequest(now.Add(time.Second)) {
+	if !h.takeKeyframeRequest(now.Add(500 * time.Millisecond)) {
 		t.Fatal("pending recovery request was lost")
 	}
 	if h.takeKeyframeRequest(now.Add(2 * time.Second)) {

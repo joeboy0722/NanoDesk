@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"fmt"
+	"kvm/core/streamtrace"
 	"runtime"
 	"sync"
 	"syscall"
@@ -44,6 +45,8 @@ type encoderCommand struct {
 }
 
 func NewH264Encoder(width, height, fps, bitrateKbps int) (*H264Encoder, error) {
+	done := streamtrace.Span("encoder.create", 0, 0)
+	defer done(int64(bitrateKbps), 0)
 	if width <= 0 || height <= 0 || width > 16384 || height > 16384 || int64(width)*int64(height) > 64*1024*1024 {
 		return nil, fmt.Errorf("invalid encoder dimensions")
 	}
@@ -68,7 +71,9 @@ func NewH264Encoder(width, height, fps, bitrateKbps int) (*H264Encoder, error) {
 				if n < 0 || n > len(out) {
 					cmd.err = fmt.Errorf("H.264 編碼錯誤: %d", n)
 				} else {
+					copyDone := streamtrace.Span("encode.go_output_copy", 0, 0)
 					cmd.data = append([]byte(nil), out[:n]...)
+					copyDone(int64(n), 0)
 					cmd.key = key != 0
 				}
 			case 1:
@@ -109,6 +114,8 @@ func (e *H264Encoder) RequestKeyframe() {
 	<-cmd.done
 }
 func (e *H264Encoder) Close() {
+	done := streamtrace.Span("encoder.close", 0, 0)
+	defer done(0, 0)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {

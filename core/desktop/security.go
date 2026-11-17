@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"kvm/core/streamtrace"
 	"time"
 
 	"kvm/core/auth"
@@ -27,19 +28,48 @@ func (c *Client) enqueueFrame(data []byte) bool {
 		return false
 	default:
 	}
+
+	streamtrace.Emit(streamtrace.Event{Stage: "host.queue_depth", Object: c.traceObject(), Value: int64(len(c.sendChan))})
 	if c.needsKey && data[0] != 1 {
+		streamtrace.Emit(streamtrace.Event{Stage: "host.wait_idr", Object: c.traceObject()})
 		return false
 	}
 	select {
 	case c.sendChan <- data:
+		if streamtrace.Enabled() {
+			if c.traceQueued == nil {
+				c.traceQueued = map[uint32]time.Time{}
+			}
+			c.traceQueued[tracePacketID(data)] = time.Now()
+		}
 		c.needsKey = false
 		return false
 	default:
+		streamtrace.Emit(streamtrace.Event{Stage: "host.queue_overflow", Object: c.traceObject()})
 		for {
 			select {
-			case <-c.sendChan:
+			case dropped := <-c.sendChan:
+				delete(c.traceQueued, tracePacketID(dropped))
 			default:
 				c.needsKey = true
+				// An incoming IDR is independent of the discarded GOP. Keep it
+				// instead of throwing away the recovery and requesting another
+				// one behind the host's keyframe cooldown.
+				if data[0] == 1 {
+					select {
+					case c.sendChan <- data:
+						c.needsKey = false
+						if streamtrace.Enabled() {
+							if c.traceQueued == nil {
+								c.traceQueued = map[uint32]time.Time{}
+							}
+							c.traceQueued[tracePacketID(data)] = time.Now()
+						}
+						streamtrace.Emit(streamtrace.Event{Stage: "host.queue_recovery_key_kept", Object: c.traceObject(), Frame: uint64(tracePacketID(data))})
+						return false
+					default:
+					}
+				}
 				return true
 			}
 		}

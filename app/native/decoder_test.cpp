@@ -18,3 +18,6 @@ extern "C" void ND_TestDecoderClose(void *p) {
     MFShutdown();
     CoUninitialize();
 }
+
+extern "C" void ND_TestDecoderTrace(void* p,unsigned long long frame){if(p)((Decoder*)p)->traceInputFrame=frame;}
+extern "C" void ND_DecoderReset(void* p){if(p)((Decoder*)p)->reset();}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/gorilla/websocket"
 	"kvm/core/identity"
+	"kvm/core/streamtrace"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,6 +39,7 @@ func relayPeerAPI(path *protocol.RelayPath, caller bool, config identity.Setting
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("中繼路徑建立失敗: %w", err)
 	}
+	streamtrace.Emit(streamtrace.Event{Stage: "relay.configuration", Value: path.BandwidthMbps, Result: boolInt(config.RelayTLSOnly || path.TLS)})
 	conn.SetPacingMbps(path.BandwidthMbps)
 	stable := relay.NewSwitchConn(conn, local, onFailure)
 	var mux ice.UDPMux = ice.NewUDPMuxDefault(ice.UDPMuxParams{UDPConn: stable})
@@ -207,6 +209,7 @@ func (p *Peer) replaceRelay(path *protocol.RelayPath) error {
 	if err != nil {
 		return err
 	}
+	streamtrace.Emit(streamtrace.Event{Stage: "relay.configuration", Value: path.BandwidthMbps, Result: boolInt(config.RelayTLSOnly || path.TLS)})
 	conn.SetPacingMbps(path.BandwidthMbps)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -217,10 +220,18 @@ func (p *Peer) replaceRelay(path *protocol.RelayPath) error {
 	if err := stable.Replace(conn); err != nil {
 		return err
 	}
+	p.traceRelayTLS.Store(config.RelayTLSOnly || path.TLS)
 	p.relayGeneration = path.Credentials.Generation
 	p.relayBudgetMbps.Store(path.BandwidthMbps)
 	p.relayRecovering = false
 	p.relayRecoveryTicket++
 	p.engine.emit(Event{Kind: "peer_status", Session: p.sid, Text: "中繼路徑已恢復"})
 	return nil
+}
+
+func boolInt(v bool) int64 {
+	if v {
+		return 1
+	}
+	return 0
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"kvm/core/streamtrace"
 	"os"
 	"runtime"
 	"slices"
@@ -53,6 +54,7 @@ func (v *viewState) clipboardGrant() func() bool {
 }
 
 func main() {
+	defer streamtrace.Close()
 	runtime.LockOSThread()
 	defer func() {
 		if r := recover(); r != nil {
@@ -83,7 +85,7 @@ func main() {
 		native.Error(err.Error())
 		return
 	}
-	e, err := engine.New(state)
+	e, err := engine.NewWithServices(state, engine.Services{VideoSink: native.NewVideoSink()})
 	if err != nil {
 		native.Error(err.Error())
 		return
@@ -374,6 +376,11 @@ func main() {
 				case "peer_status", "file_status":
 					native.Text(msg.Session, msg.Text)
 				case "closed":
+					if msg.VideoSession != 0 {
+						if generation := e.VideoSession(msg.Session); generation != 0 && generation != msg.VideoSession {
+							break
+						}
+					}
 					if v := views[msg.Session]; v != nil {
 						v.setClipboardAllowed(false)
 					}
@@ -387,10 +394,7 @@ func main() {
 					}
 				case "approval_close":
 					native.CloseApproval(msg.Session)
-				case "video":
-					if native.Frame(msg.Session, msg.Data) < 0 {
-						send(msg.Session, map[string]any{"type": "request_keyframe"})
-					}
+
 				case "control":
 					v := views[msg.Session]
 					if v == nil {
@@ -402,6 +406,7 @@ func main() {
 						Role         int
 						Monitors     []capture.Monitor
 						Current      int
+						Reused       bool   `json:"reused"`
 						ControllerID string `json:"controller_id"`
 						LocalActive  bool   `json:"local_active"`
 						Members      []struct {
@@ -415,6 +420,8 @@ func main() {
 						break
 					}
 					switch m.Type {
+					case "source_frame_state":
+						native.SourceState(msg.Session, m.Reused)
 					case "auth_success":
 						v.role = m.Role
 						send(msg.Session, map[string]any{"type": "clipboard_batch_hello"})
@@ -491,16 +498,7 @@ func main() {
 				i = 16
 			}
 		}
-		for i := 0; i < 3; i++ {
-			select {
-			case frame := <-e.Frames:
-				if native.Frame(frame.Session, frame.Data) < 0 {
-					send(frame.Session, map[string]any{"type": "request_keyframe"})
-				}
-			default:
-				i = 3
-			}
-		}
+
 		if time.Since(clipTimer) > 100*time.Millisecond {
 			clipTimer = time.Now()
 			seq := clipboard.GetSequenceNumber()

@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"fmt"
+	"kvm/core/streamtrace"
 	"sync"
 	"time"
 	"unsafe"
@@ -16,6 +17,7 @@ import (
 
 // DXGICapturer 實作 Capturer 介面的 DXGI GPU 高速擷取引擎
 type DXGICapturer struct {
+	fresh       map[int]int64
 	mu          sync.Mutex
 	monitors    []Monitor
 	initialized bool
@@ -99,12 +101,14 @@ func (d *DXGICapturer) CaptureFrame(monitorIdx int) (*Frame, error) {
 	buf := d.buffers[monitorIdx]
 
 	// 呼叫底層 C++ 進行 GPU 抓幀 (等待最高 100ms)
+	traceDone := streamtrace.Span("capture.dxgi", uint64(monitorIdx+1), 0)
 	ret := C.DXGI_CaptureFrame(
 		C.int(monitorIdx),
 		(*C.uchar)(unsafe.Pointer(&buf[0])),
 		C.int(100),
 	)
 
+	traceDone(0, int64(ret))
 	// ret == 0 表示該期間畫面完全靜止無變動，仍回傳上一幀暫存
 	// ret == 1 表示成功捕獲新畫面
 	// ret < 0 表示錯誤
@@ -112,7 +116,14 @@ func (d *DXGICapturer) CaptureFrame(monitorIdx int) (*Frame, error) {
 		return nil, fmt.Errorf("DXGI 擷取訊框失敗 (code: %d)", int(ret))
 	}
 
+	if d.fresh == nil {
+		d.fresh = map[int]int64{}
+	}
+	if ret == 1 {
+		d.fresh[monitorIdx] = time.Now().UnixMicro()
+	}
 	return &Frame{
+		Reused: ret == 0, LastFreshMicro: d.fresh[monitorIdx],
 		Width:     m.Width,
 		Height:    m.Height,
 		Data:      buf,
@@ -131,6 +142,7 @@ func (d *DXGICapturer) Close() error {
 		d.initialized = false
 	}
 	d.buffers = make(map[int][]byte)
+	d.fresh = nil
 	d.monitors = nil
 	return nil
 }

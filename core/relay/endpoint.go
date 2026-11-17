@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"golang.org/x/time/rate"
+	"kvm/core/streamtrace"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -245,6 +246,7 @@ func (e *Endpoint) enqueueLocked(r *route, kind Kind, payload []byte, address ne
 		for _, limiter := range r.limiters {
 			if !limiter.AllowN(time.Now(), len(payload)+HeaderSize+TagSize) {
 				e.traffic.dropped.Add(1)
+				streamtrace.Emit(streamtrace.Event{Stage: "relay.server_rate_drop"})
 				return
 			}
 		}
@@ -256,12 +258,14 @@ func (e *Endpoint) enqueueLocked(r *route, kind Kind, payload []byte, address ne
 	}
 	if len(r.queue) >= 32 {
 		e.traffic.dropped.Add(1)
+		streamtrace.Emit(streamtrace.Event{Stage: "relay.server_route_queue_drop"})
 		return
 	}
 	for {
 		count := e.queued.Load()
 		if count >= 256 {
 			e.traffic.dropped.Add(1)
+			streamtrace.Emit(streamtrace.Event{Stage: "relay.server_global_queue_drop"})
 			return
 		}
 		if e.queued.CompareAndSwap(count, count+1) {
@@ -304,6 +308,7 @@ func (e *Endpoint) send() {
 			}
 			if err != nil {
 				e.traffic.dropped.Add(1)
+				streamtrace.Emit(streamtrace.Event{Stage: "relay.server_write_drop"})
 			}
 		}
 	}
